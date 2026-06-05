@@ -1,40 +1,33 @@
 from flask import Flask, request, jsonify
 import requests
-import os
-from datetime import datetime
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+OPENWEATHER_API_KEY = "YOUR_OPENWEATHER_KEY"
 
-
-# =========================
-# HELP: OpenWeather fetch
-# =========================
-def get_weather(lat, lon):
-    url = "https://api.openweathermap.org/data/2.5/weather"
-    return requests.get(url, params={
-        "lat": lat,
-        "lon": lon,
-        "appid": API_KEY,
-        "units": "metric",
-        "lang": "ru"
-    }).json()
-
-
-# =========================
-# 1. LOCATION SEARCH (HTC)
-# =========================
+# -----------------------------
+# 1. GEO SEARCH (HTC -> OpenWeather)
+# -----------------------------
 @app.route("/locations/v1/cities/geoposition/search")
-def geo_search():
+def geoposition_search():
     q = request.args.get("q", "0,0")
-    lat, lon = q.split(",")
+
+    try:
+        lat, lon = q.split(",")
+    except:
+        lat, lon = "0", "0"
+
+    url = (
+        "https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+    )
+
+    data = requests.get(url).json()
 
     return jsonify({
-        "Key": f"{lat}_{lon}",
-        "Type": "City",
-        "LocalizedName": "Fastiv",
-        "Country": {"ID": "UA"},
+        "Key": str(data.get("id", 0)),
+        "LocalizedName": data.get("name", "Unknown"),
+        "Country": {"ID": data.get("sys", {}).get("country", "")},
         "GeoPosition": {
             "Latitude": float(lat),
             "Longitude": float(lon)
@@ -42,100 +35,87 @@ def geo_search():
     })
 
 
-# =========================
-# 2. CURRENT CONDITIONS
-# =========================
+# -----------------------------
+# 2. CURRENT CONDITIONS (HTC)
+# -----------------------------
 @app.route("/currentconditions/v1/<location_key>")
-def current(location_key):
-    lat, lon = location_key.split("_")
-    data = get_weather(lat, lon)
+def current_conditions(location_key):
+    lat = request.args.get("lat", "0")
+    lon = request.args.get("lon", "0")
+
+    url = (
+        "https://api.openweathermap.org/data/2.5/weather"
+        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+    )
+
+    data = requests.get(url).json()
+
+    weather = data["weather"][0]
 
     return jsonify([{
-        "LocalObservationDateTime": datetime.utcnow().isoformat() + "Z",
-        "EpochTime": int(datetime.utcnow().timestamp()),
-
-        "WeatherText": data["weather"][0]["description"],
-        "WeatherIcon": 7,  # можно улучшить позже mapping
-
-        "HasPrecipitation": "rain" in data["weather"][0]["main"].lower(),
-
+        "WeatherText": weather["main"],
+        "WeatherIcon": int(weather["icon"].replace("n", "").replace("d", "01") if weather["icon"].isdigit() else 1),
         "Temperature": {
             "Metric": {
-                "Value": round(data["main"]["temp"], 1),
-                "Unit": "C"
+                "Value": data["main"]["temp"]
             }
         },
-
         "RealFeelTemperature": {
             "Metric": {
-                "Value": round(data["main"]["feels_like"], 1),
-                "Unit": "C"
+                "Value": data["main"]["feels_like"]
             }
         },
-
         "RelativeHumidity": data["main"]["humidity"],
-
         "Wind": {
             "Speed": {
                 "Metric": {
-                    "Value": data["wind"]["speed"],
-                    "Unit": "m/s"
+                    "Value": data["wind"]["speed"]
                 }
             }
-        }
+        },
+        "UVIndex": 0
     }])
 
 
-# =========================
-# 3. 5-DAY FORECAST (HTC style)
-# =========================
+# -----------------------------
+# 3. FORECAST (5 DAY SIMPLIFIED)
+# -----------------------------
 @app.route("/forecasts/v1/daily/5day/<location_key>")
 def forecast(location_key):
-    lat, lon = location_key.split("_")
+    lat = request.args.get("lat", "0")
+    lon = request.args.get("lon", "0")
 
-    data = get_weather(lat, lon)
-    temp = data["main"]["temp"]
+    url = (
+        "https://api.openweathermap.org/data/2.5/forecast"
+        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+    )
 
-    # простая эмуляция (HTC важно наличие структуры)
-    days = []
+    data = requests.get(url).json()
 
-    for i in range(5):
-        days.append({
-            "Date": datetime.utcnow().isoformat() + "Z",
-            "EpochDate": int(datetime.utcnow().timestamp()),
+    daily = []
 
+    for i in range(0, min(len(data["list"]), 5)):
+        item = data["list"][i]
+
+        daily.append({
+            "Date": item["dt_txt"],
             "Temperature": {
-                "Minimum": {"Value": temp - 3 - i},
-                "Maximum": {"Value": temp + 2 + i}
+                "Maximum": {"Value": item["main"]["temp_max"]},
+                "Minimum": {"Value": item["main"]["temp_min"]}
             },
-
             "Day": {
-                "Icon": 7,
-                "IconPhrase": data["weather"][0]["description"]
-            },
-
-            "Night": {
-                "Icon": 33,
-                "IconPhrase": "clear"
+                "Icon": item["weather"][0]["icon"],
+                "IconPhrase": item["weather"][0]["main"]
             }
         })
 
     return jsonify({
-        "Headline": {
-            "Text": "Forecast",
-            "Category": "weather"
-        },
-        "DailyForecasts": days
+        "DailyForecasts": daily
     })
 
 
-# =========================
-# HEALTH CHECK
-# =========================
-@app.route("/")
-def home():
-    return "HTC Weather Emulator FULL RUNNING"
-
-
+# -----------------------------
+# START
+# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
