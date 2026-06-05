@@ -4,8 +4,29 @@ import os
 
 app = Flask(__name__)
 
-# OpenWeather API key из Render Environment Variables
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+
+
+# -----------------------------
+# HTC ICON MAPPING
+# -----------------------------
+def htc_icon(weather_main: str) -> int:
+    w = (weather_main or "").lower()
+
+    if "clear" in w:
+        return 1
+    if "cloud" in w:
+        return 3
+    if "rain" in w or "drizzle" in w:
+        return 12
+    if "thunder" in w:
+        return 15
+    if "snow" in w:
+        return 16
+    if "mist" in w or "fog" in w or "haze" in w:
+        return 7
+
+    return 1
 
 
 # -----------------------------
@@ -17,7 +38,7 @@ def home():
 
 
 # -----------------------------
-# GEO SEARCH (HTC)
+# GEO SEARCH
 # -----------------------------
 @app.route("/locations/v1/cities/geoposition/search")
 def geoposition_search():
@@ -38,9 +59,7 @@ def geoposition_search():
     return jsonify({
         "Key": str(data.get("id", 0)),
         "LocalizedName": data.get("name", "Unknown"),
-        "Country": {
-            "ID": data.get("sys", {}).get("country", "")
-        },
+        "Country": {"ID": data.get("sys", {}).get("country", "")},
         "GeoPosition": {
             "Latitude": float(lat),
             "Longitude": float(lon)
@@ -49,7 +68,7 @@ def geoposition_search():
 
 
 # -----------------------------
-# CURRENT CONDITIONS (HTC)
+# CURRENT CONDITIONS
 # -----------------------------
 @app.route("/currentconditions/v1/<location_key>")
 def current_conditions(location_key):
@@ -70,8 +89,8 @@ def current_conditions(location_key):
 
         return jsonify([{
             "WeatherText": weather.get("main", "Unknown"),
-            "WeatherIcon": 1,
-            "HasPrecipitation": False,
+            "WeatherIcon": htc_icon(weather.get("main")),
+            "HasPrecipitation": "rain" in (weather.get("main", "").lower()),
             "IsDayTime": True,
             "Temperature": {
                 "Metric": {
@@ -112,7 +131,7 @@ def current_conditions(location_key):
 
 
 # -----------------------------
-# FORECAST (HTC 5-DAY FIXED)
+# FORECAST (HTC 5-DAY FIXED + ICONS)
 # -----------------------------
 @app.route("/forecasts/v1/daily/5day/<location_key>")
 def forecast(location_key):
@@ -156,7 +175,7 @@ def forecast(location_key):
                     "Minimum": {"Value": d["min"]}
                 },
                 "Day": {
-                    "Icon": 1,
+                    "Icon": htc_icon(d["phrase"]),
                     "IconPhrase": d["phrase"]
                 }
             })
