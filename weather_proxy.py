@@ -1,33 +1,38 @@
 from flask import Flask, request, jsonify
 import requests
+import os
 
 app = Flask(__name__)
 
-OPENWEATHER_API_KEY = "YOUR_OPENWEATHER_KEY"
+# 🔐 API KEY берётся из Render Environment Variables
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+
 
 # -----------------------------
-# 1. GEO SEARCH (HTC -> OpenWeather)
+# 1. GEO POSITION SEARCH (HTC)
 # -----------------------------
 @app.route("/locations/v1/cities/geoposition/search")
 def geoposition_search():
-    q = request.args.get("q", "0,0")
+    q = request.args.get("q", "50,30")
 
     try:
         lat, lon = q.split(",")
     except:
-        lat, lon = "0", "0"
+        lat, lon = "50", "30"
 
     url = (
         "https://api.openweathermap.org/data/2.5/weather"
         f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
     )
 
-    data = requests.get(url).json()
+    data = requests.get(url, timeout=5).json()
 
     return jsonify({
         "Key": str(data.get("id", 0)),
         "LocalizedName": data.get("name", "Unknown"),
-        "Country": {"ID": data.get("sys", {}).get("country", "")},
+        "Country": {
+            "ID": data.get("sys", {}).get("country", "")
+        },
         "GeoPosition": {
             "Latitude": float(lat),
             "Longitude": float(lon)
@@ -36,82 +41,118 @@ def geoposition_search():
 
 
 # -----------------------------
-# 2. CURRENT CONDITIONS (HTC)
+# 2. CURRENT CONDITIONS (HTC SAFE)
 # -----------------------------
 @app.route("/currentconditions/v1/<location_key>")
 def current_conditions(location_key):
-    lat = request.args.get("lat", "0")
-    lon = request.args.get("lon", "0")
+    try:
+        lat = request.args.get("lat", "50")
+        lon = request.args.get("lon", "30")
 
-    url = (
-        "https://api.openweathermap.org/data/2.5/weather"
-        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
-    )
+        url = (
+            "https://api.openweathermap.org/data/2.5/weather"
+            f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+        )
 
-    data = requests.get(url).json()
+        data = requests.get(url, timeout=5).json()
 
-    weather = data["weather"][0]
+        weather = (data.get("weather") or [{}])[0]
+        main = data.get("main") or {}
+        wind = data.get("wind") or {}
 
-    return jsonify([{
-        "WeatherText": weather["main"],
-        "WeatherIcon": int(weather["icon"].replace("n", "").replace("d", "01") if weather["icon"].isdigit() else 1),
-        "Temperature": {
-            "Metric": {
-                "Value": data["main"]["temp"]
-            }
-        },
-        "RealFeelTemperature": {
-            "Metric": {
-                "Value": data["main"]["feels_like"]
-            }
-        },
-        "RelativeHumidity": data["main"]["humidity"],
-        "Wind": {
-            "Speed": {
+        return jsonify([{
+            "WeatherText": weather.get("main", "Unknown"),
+            "WeatherIcon": 1,
+            "HasPrecipitation": False,
+            "IsDayTime": True,
+            "Temperature": {
                 "Metric": {
-                    "Value": data["wind"]["speed"]
+                    "Value": main.get("temp", 0),
+                    "Unit": "C"
+                }
+            },
+            "RealFeelTemperature": {
+                "Metric": {
+                    "Value": main.get("feels_like", 0),
+                    "Unit": "C"
+                }
+            },
+            "RelativeHumidity": main.get("humidity", 0),
+            "Wind": {
+                "Speed": {
+                    "Metric": {
+                        "Value": wind.get("speed", 0),
+                        "Unit": "km/h"
+                    }
                 }
             }
-        },
-        "UVIndex": 0
-    }])
+        }])
+
+    except Exception as e:
+        print("CURRENT ERROR:", e)
+
+        return jsonify([{
+            "WeatherText": "Unavailable",
+            "WeatherIcon": 0,
+            "HasPrecipitation": False,
+            "IsDayTime": True,
+            "Temperature": {"Metric": {"Value": 0}},
+            "RealFeelTemperature": {"Metric": {"Value": 0}},
+            "RelativeHumidity": 0,
+            "Wind": {"Speed": {"Metric": {"Value": 0}}}
+        }])
 
 
 # -----------------------------
-# 3. FORECAST (5 DAY SIMPLIFIED)
+# 3. FORECAST (5 DAY SIMPLE)
 # -----------------------------
 @app.route("/forecasts/v1/daily/5day/<location_key>")
 def forecast(location_key):
-    lat = request.args.get("lat", "0")
-    lon = request.args.get("lon", "0")
+    try:
+        lat = request.args.get("lat", "50")
+        lon = request.args.get("lon", "30")
 
-    url = (
-        "https://api.openweathermap.org/data/2.5/forecast"
-        f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
-    )
+        url = (
+            "https://api.openweathermap.org/data/2.5/forecast"
+            f"?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+        )
 
-    data = requests.get(url).json()
+        data = requests.get(url, timeout=5).json()
 
-    daily = []
+        daily = []
+        for i in range(0, min(5, len(data.get("list", [])))):
+            item = data["list"][i]
 
-    for i in range(0, min(len(data["list"]), 5)):
-        item = data["list"][i]
+            daily.append({
+                "Date": item.get("dt_txt", ""),
+                "Temperature": {
+                    "Maximum": {"Value": item["main"].get("temp_max", 0)},
+                    "Minimum": {"Value": item["main"].get("temp_min", 0)}
+                },
+                "Day": {
+                    "Icon": 1,
+                    "IconPhrase": (item.get("weather") or [{}])[0].get("main", "")
+                }
+            })
 
-        daily.append({
-            "Date": item["dt_txt"],
-            "Temperature": {
-                "Maximum": {"Value": item["main"]["temp_max"]},
-                "Minimum": {"Value": item["main"]["temp_min"]}
-            },
-            "Day": {
-                "Icon": item["weather"][0]["icon"],
-                "IconPhrase": item["weather"][0]["main"]
-            }
+        return jsonify({
+            "DailyForecasts": daily
         })
 
-    return jsonify({
-        "DailyForecasts": daily
-    })
+    except Exception as e:
+        print("FORECAST ERROR:", e)
+
+        return jsonify({
+            "DailyForecasts": []
+        })
+
+
+# -----------------------------
+# HEALTH CHECK
+# -----------------------------
+@app.route("/")
+def home():
+    return "HTC Weather Proxy Running"
 
 
 # -----------------------------
