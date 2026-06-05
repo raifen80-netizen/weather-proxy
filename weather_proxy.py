@@ -4,12 +4,20 @@ import os
 
 app = Flask(__name__)
 
-# 🔐 API KEY берётся из Render Environment Variables
+# OpenWeather API key из Render Environment Variables
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
 
 
 # -----------------------------
-# 1. GEO POSITION SEARCH (HTC)
+# ROOT
+# -----------------------------
+@app.route("/")
+def home():
+    return "HTC Weather Proxy Running"
+
+
+# -----------------------------
+# GEO SEARCH (HTC)
 # -----------------------------
 @app.route("/locations/v1/cities/geoposition/search")
 def geoposition_search():
@@ -41,7 +49,7 @@ def geoposition_search():
 
 
 # -----------------------------
-# 2. CURRENT CONDITIONS (HTC SAFE)
+# CURRENT CONDITIONS (HTC)
 # -----------------------------
 @app.route("/currentconditions/v1/<location_key>")
 def current_conditions(location_key):
@@ -104,7 +112,7 @@ def current_conditions(location_key):
 
 
 # -----------------------------
-# 3. FORECAST (5 DAY SIMPLE)
+# FORECAST (HTC 5-DAY FIXED)
 # -----------------------------
 @app.route("/forecasts/v1/daily/5day/<location_key>")
 def forecast(location_key):
@@ -119,24 +127,42 @@ def forecast(location_key):
 
         data = requests.get(url, timeout=5).json()
 
-        daily = []
-        for i in range(0, min(5, len(data.get("list", [])))):
-            item = data["list"][i]
+        days = {}
 
-            daily.append({
-                "Date": item.get("dt_txt", ""),
+        for item in data.get("list", []):
+            date = item["dt_txt"].split(" ")[0]
+
+            if date not in days:
+                days[date] = {
+                    "max": -999,
+                    "min": 999,
+                    "phrase": ""
+                }
+
+            temp = item["main"]["temp"]
+            days[date]["max"] = max(days[date]["max"], temp)
+            days[date]["min"] = min(days[date]["min"], temp)
+
+            weather = (item.get("weather") or [{}])[0]
+            days[date]["phrase"] = weather.get("main", "")
+
+        result = []
+
+        for date, d in list(days.items())[:5]:
+            result.append({
+                "Date": date,
                 "Temperature": {
-                    "Maximum": {"Value": item["main"].get("temp_max", 0)},
-                    "Minimum": {"Value": item["main"].get("temp_min", 0)}
+                    "Maximum": {"Value": d["max"]},
+                    "Minimum": {"Value": d["min"]}
                 },
                 "Day": {
                     "Icon": 1,
-                    "IconPhrase": (item.get("weather") or [{}])[0].get("main", "")
+                    "IconPhrase": d["phrase"]
                 }
             })
 
         return jsonify({
-            "DailyForecasts": daily
+            "DailyForecasts": result
         })
 
     except Exception as e:
@@ -145,14 +171,6 @@ def forecast(location_key):
         return jsonify({
             "DailyForecasts": []
         })
-
-
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
-@app.route("/")
-def home():
-    return "HTC Weather Proxy Running"
 
 
 # -----------------------------
