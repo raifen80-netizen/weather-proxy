@@ -1,188 +1,213 @@
 from flask import Flask, request, jsonify
 import requests
 import os
+import time
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
-
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
-BASE_URL = "https://api.openweathermap.org/data/2.5"
+BASE = "https://api.openweathermap.org/data/2.5"
+
+# =========================
+# CACHE (Sense-like speed)
+# =========================
+
+CACHE = {}
+CACHE_TTL = 300  # 5 min
 
 
 # =========================
-# ICON MAPPING (HTC STYLE)
+# HTC ICON MAP (REALISTIC)
 # =========================
 
-def map_icon(main):
-    main = (main or "").lower()
+def icon_map(main):
+    m = (main or "").lower()
 
-    if "thunder" in main or "storm" in main:
+    if "thunder" in m:
         return 15
-    if "rain" in main or "drizzle" in main:
+    if "drizzle" in m:
+        return 11
+    if "rain" in m:
         return 12
-    if "snow" in main:
+    if "snow" in m:
         return 22
-    if "cloud" in main:
+    if "fog" in m or "mist" in m:
+        return 20
+    if "cloud" in m:
         return 7
-    if "clear" in main or "sun" in main:
+    if "clear" in m or "sun" in m:
         return 1
 
     return 7
 
 
 # =========================
-# SAFE REQUEST
+# SAFE FETCH
 # =========================
 
-def safe_get(url):
+def get_json(url):
     try:
         r = requests.get(url, timeout=10)
-        data = r.json()
-        return data
+        return r.json()
     except:
         return {}
 
 
 # =========================
-# GEOPOSITION SEARCH (HTC)
+# CACHE WRAPPER
 # =========================
 
-def geocode(lat, lon):
-    url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    data = safe_get(url)
+def cached(key, fn):
+    now = time.time()
 
-    if str(data.get("cod")) != "200":
-        return {
-            "Key": f"{lat},{lon}",
-            "LocalizedName": "Kyiv",
-            "Country": "UA"
-        }
+    if key in CACHE:
+        data, ts = CACHE[key]
+        if now - ts < CACHE_TTL:
+            return data
 
-    return {
-        "Key": f"{lat},{lon}",
-        "LocalizedName": data.get("name") or "Kyiv",
-        "Country": data.get("sys", {}).get("country") or "UA"
-    }
+    data = fn()
+    CACHE[key] = (data, now)
+    return data
 
 
 # =========================
-# CURRENT CONDITIONS (HTC CORE)
+# SAFE WEATHER STATE
 # =========================
 
-def current_conditions(lat, lon):
-    url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    data = safe_get(url)
-
-    if str(data.get("cod")) != "200":
-        return [{
-            "WeatherText": "Clear",
-            "WeatherIcon": 1,
-            "Temperature": {
-                "Metric": {"Value": 20}
-            }
-        }]
-
-    weather = (data.get("weather") or [{}])[0]
-    main = data.get("main", {})
-
+def safe_state():
     return [{
-        "WeatherText": weather.get("main", "Clear"),
-        "WeatherIcon": map_icon(weather.get("main")),
-        "Temperature": {
-            "Metric": {
-                "Value": main.get("temp", 20)
-            }
-        }
+        "WeatherText": "Clear",
+        "WeatherIcon": 1,
+        "Temperature": {"Metric": {"Value": 20}}
     }]
 
 
 # =========================
-# FORECAST (HTC 5-DAY STYLE)
+# CURRENT CONDITIONS (SENSE CORE)
+# =========================
+
+def current(lat, lon):
+    def fetch():
+        url = f"{BASE}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+        d = get_json(url)
+
+        if str(d.get("cod")) != "200":
+            return safe_state()
+
+        weather = (d.get("weather") or [{}])[0]
+        main = d.get("main", {})
+
+        temp = main.get("temp", 20)
+
+        return [{
+            "WeatherText": weather.get("main", "Clear"),
+            "WeatherIcon": icon_map(weather.get("main")),
+            "Temperature": {
+                "Metric": {"Value": temp}
+            }
+        }]
+
+    return cached(f"cur:{lat},{lon}", fetch)
+
+
+# =========================
+# GEO LOCATION (HTC STYLE)
+# =========================
+
+def geo(lat, lon):
+    def fetch():
+        url = f"{BASE}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+        d = get_json(url)
+
+        if str(d.get("cod")) != "200":
+            return {
+                "Key": f"{lat},{lon}",
+                "LocalizedName": "Kyiv",
+                "Country": "UA"
+            }
+
+        return {
+            "Key": f"{lat},{lon}",
+            "LocalizedName": d.get("name") or "Kyiv",
+            "Country": d.get("sys", {}).get("country") or "UA"
+        }
+
+    return cached(f"geo:{lat},{lon}", fetch)
+
+
+# =========================
+# FORECAST (HTC STYLE 5 DAY)
 # =========================
 
 def forecast(lat, lon):
-    url = f"{BASE_URL}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    data = safe_get(url)
+    def fetch():
+        url = f"{BASE}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+        d = get_json(url)
 
-    if str(data.get("cod")) != "200":
-        return {"DailyForecasts": []}
+        if str(d.get("cod")) != "200":
+            return {"DailyForecasts": []}
 
-    daily = {}
+        days = {}
 
-    for item in data.get("list", []):
-        date = item["dt_txt"].split(" ")[0]
-        temp = item["main"]["temp"]
-        text = item["weather"][0]["main"]
+        for i in d.get("list", []):
+            date = i["dt_txt"].split(" ")[0]
+            temp = i["main"]["temp"]
+            txt = i["weather"][0]["main"]
 
-        if date not in daily:
-            daily[date] = {
-                "min": temp,
-                "max": temp,
-                "text": text
-            }
-        else:
-            daily[date]["min"] = min(daily[date]["min"], temp)
-            daily[date]["max"] = max(daily[date]["max"], temp)
+            if date not in days:
+                days[date] = {"min": temp, "max": temp, "txt": txt}
+            else:
+                days[date]["min"] = min(days[date]["min"], temp)
+                days[date]["max"] = max(days[date]["max"], temp)
 
-    result = []
+        out = []
+        for date, v in list(days.items())[:5]:
+            out.append({
+                "Date": date,
+                "Day": {
+                    "Icon": icon_map(v["txt"]),
+                    "IconPhrase": v["txt"]
+                },
+                "Temperature": {
+                    "Minimum": {"Value": v["min"]},
+                    "Maximum": {"Value": v["max"]}
+                }
+            })
 
-    for date, v in list(daily.items())[:5]:
-        result.append({
-            "Date": date,
-            "Day": {
-                "Icon": map_icon(v["text"]),
-                "IconPhrase": v["text"]
-            },
-            "Temperature": {
-                "Minimum": {"Value": v["min"]},
-                "Maximum": {"Value": v["max"]}
-            }
-        })
+        return {"DailyForecasts": out}
 
-    return {"DailyForecasts": result}
+    return cached(f"fc:{lat},{lon}", fetch)
 
 
 # =========================
-# ENDPOINTS
+# ENDPOINTS (HTC COMPATIBLE)
 # =========================
 
 @app.route("/")
-def index():
-    return "HTC Weather Proxy OK"
+def home():
+    return "HTC Sense Weather Proxy OK"
 
 
 @app.route("/locations/v1/cities/geoposition/search")
 def search():
     q = request.args.get("q", "0,0")
-
     try:
         lat, lon = q.split(",")
     except:
         lat, lon = "0", "0"
 
-    return jsonify([geocode(lat, lon)])
+    return jsonify([geo(lat, lon)])
 
 
 @app.route("/currentconditions/v1/<key>")
-def current(key):
-    try:
-        lat, lon = key.split(",")
-    except:
-        lat, lon = "0", "0"
-
-    return jsonify(current_conditions(lat, lon))
+def cur(key):
+    lat, lon = key.split(",")
+    return jsonify(current(lat, lon))
 
 
 @app.route("/forecasts/v1/daily/5day/<key>")
-def daily(key):
-    try:
-        lat, lon = key.split(",")
-    except:
-        lat, lon = "0", "0"
-
+def fc(key):
+    lat, lon = key.split(",")
     return jsonify(forecast(lat, lon))
 
 
