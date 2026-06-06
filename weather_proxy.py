@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 import requests
 import os
 import time
@@ -9,27 +9,27 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 
-OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
-BASE = "https://api.openweathermap.org/data/2.5"
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+BASE_URL = "https://api.openweathermap.org/data/2.5"
 
 # =========================
-# CACHE (HTC style stability)
+# CACHE (HTC style speed)
 # =========================
 
 CACHE = {}
-CACHE_TTL = 300  # 5 min
+CACHE_TTL = 300  # 5 minutes
 
 
 # =========================
-# HTC ICON MAP (FINAL)
+# HTC ICON MAPPING
 # =========================
 
-def icon_map(main):
+def get_icon(main):
     m = (main or "").lower()
 
     if "thunder" in m:
         return 15
-    if "rain" in m or "drizzle" in m:
+    if "drizzle" in m or "rain" in m:
         return 12
     if "snow" in m:
         return 22
@@ -44,10 +44,10 @@ def icon_map(main):
 
 
 # =========================
-# SAFE FETCH
+# SAFE REQUEST
 # =========================
 
-def fetch(url):
+def safe_get(url):
     try:
         r = requests.get(url, timeout=10)
         return r.json()
@@ -73,45 +73,47 @@ def cached(key, fn):
 
 
 # =========================
-# HTC SAFE FALLBACK (CRITICAL)
+# SAFE FALLBACK (CRITICAL HTC FIX)
 # =========================
 
-def safe_state():
+def safe_weather():
     return [{
         "WeatherText": "Clear",
         "WeatherIcon": 1,
         "Temperature": {
-            "Metric": {"Value": 20}
+            "Metric": {
+                "Value": 20
+            }
         }
     }]
 
 
 # =========================
-# CURRENT CONDITIONS (HTC CORE FIX)
+# CURRENT CONDITIONS
 # =========================
 
-def current(lat, lon):
+def get_current(lat, lon):
     def build():
-        url = f"{BASE}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-        d = fetch(url)
+        url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+        data = safe_get(url)
 
-        if str(d.get("cod")) != "200":
-            return safe_state()
+        if str(data.get("cod")) != "200":
+            return safe_weather()
 
-        weather = (d.get("weather") or [{}])[0]
-        main = d.get("main", {})
+        weather = (data.get("weather") or [{}])[0]
+        main = data.get("main", {})
 
-        temp = main.get("temp", 20)
-
-        # 🔥 HTC SAFE GUARANTEE
+        temp = main.get("temp")
         if temp is None:
             temp = 20
 
         return [{
             "WeatherText": weather.get("main", "Clear"),
-            "WeatherIcon": icon_map(weather.get("main")),
+            "WeatherIcon": get_icon(weather.get("main")),
             "Temperature": {
-                "Metric": {"Value": temp}
+                "Metric": {
+                    "Value": temp
+                }
             }
         }]
 
@@ -119,62 +121,66 @@ def current(lat, lon):
 
 
 # =========================
-# GEO (HTC SEARCH FIX)
+# GEO LOCATION (HTC STYLE)
 # =========================
 
-def geo(lat, lon):
+def get_geo(lat, lon):
     def build():
-        url = f"{BASE}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-        d = fetch(url)
+        url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+        data = safe_get(url)
 
-        if str(d.get("cod")) != "200":
+        if str(data.get("cod")) != "200":
             return {
                 "Key": f"{lat},{lon}",
-                "LocalizedName": "Kyiv",
+                "LocalizedName": "Unknown",
                 "Country": "UA"
             }
 
         return {
             "Key": f"{lat},{lon}",
-            "LocalizedName": d.get("name") or "Kyiv",
-            "Country": d.get("sys", {}).get("country") or "UA"
+            "LocalizedName": data.get("name") or "Unknown",
+            "Country": data.get("sys", {}).get("country") or "UA"
         }
 
     return cached(f"geo:{lat},{lon}", build)
 
 
 # =========================
-# FORECAST (HTC 5 DAY FIX)
+# FORECAST (5 DAY HTC STYLE)
 # =========================
 
-def forecast(lat, lon):
+def get_forecast(lat, lon):
     def build():
-        url = f"{BASE}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-        d = fetch(url)
+        url = f"{BASE_URL}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
+        data = safe_get(url)
 
-        if str(d.get("cod")) != "200":
+        if str(data.get("cod")) != "200":
             return {"DailyForecasts": []}
 
         days = {}
 
-        for i in d.get("list", []):
-            date = i["dt_txt"].split(" ")[0]
-            temp = i["main"]["temp"]
-            txt = i["weather"][0]["main"]
+        for item in data.get("list", []):
+            date = item["dt_txt"].split(" ")[0]
+            temp = item["main"]["temp"]
+            text = item["weather"][0]["main"]
 
             if date not in days:
-                days[date] = {"min": temp, "max": temp, "txt": txt}
+                days[date] = {
+                    "min": temp,
+                    "max": temp,
+                    "text": text
+                }
             else:
                 days[date]["min"] = min(days[date]["min"], temp)
                 days[date]["max"] = max(days[date]["max"], temp)
 
-        out = []
+        result = []
         for date, v in list(days.items())[:5]:
-            out.append({
+            result.append({
                 "Date": date,
                 "Day": {
-                    "Icon": icon_map(v["txt"]),
-                    "IconPhrase": v["txt"]
+                    "Icon": get_icon(v["text"]),
+                    "IconPhrase": v["text"]
                 },
                 "Temperature": {
                     "Minimum": {"Value": v["min"]},
@@ -182,7 +188,7 @@ def forecast(lat, lon):
                 }
             })
 
-        return {"DailyForecasts": out}
+        return {"DailyForecasts": result}
 
     return cached(f"fc:{lat},{lon}", build)
 
@@ -193,7 +199,7 @@ def forecast(lat, lon):
 
 @app.route("/")
 def home():
-    return "HTC Sense Weather Proxy OK"
+    return "HTC Sense Weather Proxy Running"
 
 
 @app.route("/locations/v1/cities/geoposition/search")
@@ -201,23 +207,23 @@ def search():
     q = request.args.get("q", "0,0")
     lat, lon = q.split(",")
 
-    return jsonify([geo(lat, lon)])
+    return jsonify([get_geo(lat, lon)])
 
 
 @app.route("/currentconditions/v1/<key>")
-def cur(key):
+def current(key):
     lat, lon = key.split(",")
-    return jsonify(current(lat, lon))
+    return jsonify(get_current(lat, lon))
 
 
 @app.route("/forecasts/v1/daily/5day/<key>")
-def fc(key):
+def forecast(key):
     lat, lon = key.split(",")
-    return jsonify(forecast(lat, lon))
+    return jsonify(get_forecast(lat, lon))
 
 
 # =========================
-# RUN
+# RUN SERVER
 # =========================
 
 if __name__ == "__main__":
