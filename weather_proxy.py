@@ -14,7 +14,7 @@ except Exception:
     pass
 
 
-PROXY_VERSION = "htc-full-current-v4-key-underscore-2026-06-06"
+PROXY_VERSION = "htc-full-current-v5-geoposition-text-2026-06-06"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
@@ -26,10 +26,6 @@ CACHE = {}
 CACHE_TTL = 300
 
 
-# ============================================================
-# LOG EVERY REQUEST
-# ============================================================
-
 @app.before_request
 def log_request():
     print(
@@ -40,10 +36,6 @@ def log_request():
         flush=True
     )
 
-
-# ============================================================
-# CACHE
-# ============================================================
 
 def cache_get(key):
     item = CACHE.get(key)
@@ -63,10 +55,6 @@ def cache_set(key, data):
     CACHE[key] = (data, time.time())
 
 
-# ============================================================
-# HTTP
-# ============================================================
-
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=12)
@@ -77,24 +65,11 @@ def safe_get(url, params=None):
         return {}
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
 def parse_key(location_key):
-    """
-    HTC/AccuWeather Location Key у нас хранит координаты.
-
-    Новый безопасный формат:
-    47.694_33.268
-
-    Старый формат тоже поддерживаем:
-    47.694,33.268
-    """
     try:
         key = str(location_key).strip()
 
@@ -212,10 +187,8 @@ def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
     lat_f = float(lat)
     lon_f = float(lon)
 
-    # ВАЖНО:
-    # Не используем запятую в Key.
-    # HTC может получить location, но не пойти дальше на currentconditions,
-    # если Key содержит запятую.
+    # Важно: Key без запятой.
+    # Старый HTC может не идти дальше на currentconditions, если Key содержит запятую.
     key = f"{lat}_{lon}"
 
     return {
@@ -276,10 +249,6 @@ def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
     }
 
 
-# ============================================================
-# LOCATION
-# ============================================================
-
 def get_location_by_coords(lat, lon):
     cache_key = f"geo:{lat},{lon}"
     cached = cache_get(cache_key)
@@ -302,7 +271,7 @@ def get_location_by_coords(lat, lon):
         country = data.get("sys", {}).get("country") or "UA"
         result = accuweather_location_object(lat, lon, name, country)
     else:
-        result = accuweather_location_object(lat, lon, "Kyiv", "UA")
+        result = accuweather_location_object(lat, lon, "Широке", "UA")
 
     cache_set(cache_key, result)
     return result
@@ -346,10 +315,6 @@ def search_locations_by_text(query):
     cache_set(cache_key, result)
     return result
 
-
-# ============================================================
-# CURRENT CONDITIONS
-# ============================================================
 
 def unit_value(value, unit, unit_type):
     return {
@@ -700,10 +665,6 @@ def get_current_conditions(lat, lon):
     return result
 
 
-# ============================================================
-# DAILY FORECAST
-# ============================================================
-
 def make_daily_day_night(desc, icon, has_precip):
     return {
         "Icon": icon,
@@ -949,10 +910,6 @@ def get_daily_forecast(lat, lon):
     return result
 
 
-# ============================================================
-# HOURLY FORECAST
-# ============================================================
-
 def get_hourly_forecast(lat, lon):
     cache_key = f"hourly:{lat},{lon}"
     cached = cache_get(cache_key)
@@ -1086,10 +1043,6 @@ def get_hourly_forecast(lat, lon):
     return result
 
 
-# ============================================================
-# ROUTES
-# ============================================================
-
 @app.route("/")
 def home():
     return "HTC Weather Proxy FULL OK"
@@ -1120,13 +1073,25 @@ def debug():
 @app.route("/locations/v1/cities/geoposition/search.json")
 def geoposition_search():
     q = request.args.get("q") or request.args.get("query") or "47.694,33.268"
+    q = str(q).strip()
 
-    try:
-        lat, lon = q.split(",", 1)
-    except Exception:
-        lat, lon = "47.694", "33.268"
+    # Вариант 1: HTC передал координаты
+    # Например: q=47.694,33.268
+    if "," in q:
+        try:
+            lat, lon = q.split(",", 1)
+            return jsonify(get_location_by_coords(lat.strip(), lon.strip()))
+        except Exception:
+            return jsonify(get_location_by_coords("47.694", "33.268"))
 
-    return jsonify(get_location_by_coords(lat.strip(), lon.strip()))
+    # Вариант 2: HTC почему-то передал текст города
+    # Например: q=kyiv
+    results = search_locations_by_text(q)
+
+    if results:
+        return jsonify(results[0])
+
+    return jsonify(get_location_by_coords("47.694", "33.268"))
 
 
 @app.route("/locations/v1/search")
@@ -1211,10 +1176,6 @@ def city_find_asp():
 
     return Response(xml, mimetype="text/xml")
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
