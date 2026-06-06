@@ -2,11 +2,18 @@ from flask import Flask, request, jsonify, Response
 import requests
 import os
 import time
-import math
-from datetime import datetime, timezone, timedelta
+import copy
+from datetime import datetime, timezone
 
 app = Flask(__name__)
-app.json.ensure_ascii = False
+app.config["JSON_AS_ASCII"] = False
+
+try:
+    app.json.ensure_ascii = False
+except Exception:
+    pass
+
+PROXY_VERSION = "htc-full-current-v3-2026-06-06"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
@@ -19,15 +26,32 @@ CACHE_TTL = 300
 
 
 # ============================================================
+# LOG EVERY HTC REQUEST
+# ============================================================
+
+@app.before_request
+def log_request():
+    print(
+        "HTC_REQUEST:",
+        request.method,
+        request.path,
+        dict(request.args),
+        flush=True
+    )
+
+
+# ============================================================
 # CACHE
 # ============================================================
 
 def cache_get(key):
     item = CACHE.get(key)
+
     if not item:
         return None
 
     data, ts = item
+
     if time.time() - ts < CACHE_TTL:
         return data
 
@@ -39,16 +63,16 @@ def cache_set(key, data):
 
 
 # ============================================================
-# SAFE HTTP
+# HTTP
 # ============================================================
 
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=12)
-        print("REQUEST:", r.url, "STATUS:", r.status_code)
+        print("OPENWEATHER:", r.url, "STATUS:", r.status_code, flush=True)
         return r.json()
     except Exception as e:
-        print("REQUEST ERROR:", e)
+        print("OPENWEATHER_ERROR:", str(e), flush=True)
         return {}
 
 
@@ -62,8 +86,8 @@ def now_iso():
 
 def parse_key(location_key):
     """
-    HTC/AccuWeather Location Key у нас = "lat,lon".
-    Например: 50.4501,30.5234
+    Наш AccuWeather Location Key = координаты:
+    50.4501,30.5234
     """
     try:
         key = str(location_key).strip()
@@ -109,24 +133,21 @@ def wind_direction_text(deg):
 
 def is_daytime_by_data(data):
     try:
-        now = int(data.get("dt", time.time()))
-        sys = data.get("sys", {})
-        sunrise = int(sys.get("sunrise", 0))
-        sunset = int(sys.get("sunset", 0))
+        current_time = int(data.get("dt", time.time()))
+        sys_data = data.get("sys", {})
+        sunrise = int(sys_data.get("sunrise", 0))
+        sunset = int(sys_data.get("sunset", 0))
 
         if sunrise and sunset:
-            return sunrise <= now <= sunset
+            return sunrise <= current_time <= sunset
     except Exception:
         pass
 
-    h = datetime.now().hour
-    return 6 <= h <= 20
+    hour = datetime.now().hour
+    return 6 <= hour <= 20
 
 
 def htc_icon(weather_id=None, main="", is_day=True):
-    """
-    Примерное соответствие OpenWeather -> AccuWeather/HTC icon id.
-    """
     try:
         wid = int(weather_id)
     except Exception:
@@ -134,31 +155,24 @@ def htc_icon(weather_id=None, main="", is_day=True):
 
     m = (main or "").lower()
 
-    # Thunderstorm
     if 200 <= wid < 300 or "thunder" in m or "storm" in m:
         return 15
 
-    # Drizzle
     if 300 <= wid < 400 or "drizzle" in m:
         return 11
 
-    # Rain
     if 500 <= wid < 600 or "rain" in m:
         return 12
 
-    # Snow
     if 600 <= wid < 700 or "snow" in m:
         return 22
 
-    # Fog / mist / haze
     if 700 <= wid < 800 or "fog" in m or "mist" in m or "haze" in m:
         return 20
 
-    # Clear
     if wid == 800 or "clear" in m:
         return 1 if is_day else 33
 
-    # Clouds
     if 801 <= wid <= 804 or "cloud" in m:
         return 7 if is_day else 38
 
@@ -245,6 +259,7 @@ def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
 def get_location_by_coords(lat, lon):
     cache_key = f"geo:{lat},{lon}"
     cached = cache_get(cache_key)
+
     if cached:
         return cached
 
@@ -272,6 +287,7 @@ def get_location_by_coords(lat, lon):
 def search_locations_by_text(query):
     cache_key = f"search:{query}"
     cached = cache_get(cache_key)
+
     if cached:
         return cached
 
@@ -282,7 +298,6 @@ def search_locations_by_text(query):
     }
 
     data = safe_get(OWM_DIRECT_URL, params)
-
     result = []
 
     if isinstance(data, list) and data:
@@ -298,120 +313,126 @@ def search_locations_by_text(query):
             country = item.get("country") or "UA"
             result.append(accuweather_location_object(lat, lon, name, country))
     else:
-        result.append(accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA"))
+        result.append(
+            accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA")
+        )
 
     cache_set(cache_key, result)
     return result
 
 
 # ============================================================
-# CURRENT CONDITIONS — FULL HTC/ACCUWEATHER COMPATIBLE
+# CURRENT CONDITIONS
 # ============================================================
 
-def safe_current():
-    now = datetime.now(timezone.utc)
-    epoch = int(time.time())
+def make_empty_metric(value, unit="C", unit_type=17):
+    return {
+        "Value": value,
+        "Unit": unit,
+        "UnitType": unit_type
+    }
 
-    return [{
-        "LocalObservationDateTime": now.isoformat(),
-        "EpochTime": epoch,
-        "WeatherText": "Clear",
-        "WeatherIcon": 1,
-        "HasPrecipitation": False,
-        "PrecipitationType": None,
-        "IsDayTime": True,
+
+def make_current_object(
+    epoch,
+    weather_text,
+    weather_icon,
+    is_day,
+    temp_c,
+    feels_c,
+    humidity,
+    pressure_mb,
+    wind_kmh,
+    wind_deg,
+    cloud_cover,
+    has_precip=False,
+    precip_type=None,
+    precip_1h=0.0
+):
+    temp_c = round(float(temp_c), 1)
+    feels_c = round(float(feels_c), 1)
+    temp_f = c_to_f(temp_c)
+    feels_f = c_to_f(feels_c)
+
+    dew_c = round(temp_c - ((100 - int(humidity)) / 5), 1)
+    dew_f = c_to_f(dew_c)
+
+    wind_kmh = round(float(wind_kmh), 1)
+    wind_mph = kmh_to_mph(wind_kmh)
+    wind_text = wind_direction_text(wind_deg)
+
+    precip_1h = round(float(precip_1h), 1)
+    precip_in = round(precip_1h / 25.4, 2)
+
+    temp_metric = make_empty_metric(temp_c, "C", 17)
+    temp_imperial = make_empty_metric(temp_f, "F", 18)
+
+    feels_metric = {
+        "Value": feels_c,
+        "Unit": "C",
+        "UnitType": 17,
+        "Phrase": ""
+    }
+
+    feels_imperial = {
+        "Value": feels_f,
+        "Unit": "F",
+        "UnitType": 18,
+        "Phrase": ""
+    }
+
+    precip_metric = make_empty_metric(precip_1h, "mm", 3)
+    precip_imperial = make_empty_metric(precip_in, "in", 1)
+
+    return {
+        "LocalObservationDateTime": now_iso(),
+        "EpochTime": int(epoch),
+
+        "WeatherText": weather_text,
+        "WeatherIcon": int(weather_icon),
+        "HasPrecipitation": bool(has_precip),
+        "PrecipitationType": precip_type,
+        "IsDayTime": bool(is_day),
 
         "Temperature": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": temp_metric,
+            "Imperial": temp_imperial
         },
 
         "RealFeelTemperature": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17,
-                "Phrase": ""
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18,
-                "Phrase": ""
-            }
+            "Metric": feels_metric,
+            "Imperial": feels_imperial
         },
 
         "RealFeelTemperatureShade": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17,
-                "Phrase": ""
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18,
-                "Phrase": ""
-            }
+            "Metric": feels_metric,
+            "Imperial": feels_imperial
         },
 
-        "RelativeHumidity": 50,
-        "IndoorRelativeHumidity": 50,
+        "RelativeHumidity": int(humidity),
+        "IndoorRelativeHumidity": int(humidity),
 
         "DewPoint": {
-            "Metric": {
-                "Value": 10.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 50.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": make_empty_metric(dew_c, "C", 17),
+            "Imperial": make_empty_metric(dew_f, "F", 18)
         },
 
         "Wind": {
             "Direction": {
-                "Degrees": 0,
-                "Localized": "N",
-                "English": "N"
+                "Degrees": int(wind_deg),
+                "Localized": wind_text,
+                "English": wind_text
             },
             "Speed": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "km/h",
-                    "UnitType": 7
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "mi/h",
-                    "UnitType": 9
-                }
+                "Metric": make_empty_metric(wind_kmh, "km/h", 7),
+                "Imperial": make_empty_metric(wind_mph, "mi/h", 9)
             }
         },
 
         "WindGust": {
             "Speed": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "km/h",
-                    "UnitType": 7
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "mi/h",
-                    "UnitType": 9
-                }
+                "Metric": make_empty_metric(wind_kmh, "km/h", 7),
+                "Imperial": make_empty_metric(wind_mph, "mi/h", 9)
             }
         },
 
@@ -419,44 +440,21 @@ def safe_current():
         "UVIndexText": "Low",
 
         "Visibility": {
-            "Metric": {
-                "Value": 10.0,
-                "Unit": "km",
-                "UnitType": 6
-            },
-            "Imperial": {
-                "Value": 6.2,
-                "Unit": "mi",
-                "UnitType": 2
-            }
+            "Metric": make_empty_metric(10.0, "km", 6),
+            "Imperial": make_empty_metric(6.2, "mi", 2)
         },
 
-        "CloudCover": 0,
+        "ObstructionsToVisibility": "",
+        "CloudCover": int(cloud_cover),
 
         "Ceiling": {
-            "Metric": {
-                "Value": 0.0,
-                "Unit": "m",
-                "UnitType": 5
-            },
-            "Imperial": {
-                "Value": 0.0,
-                "Unit": "ft",
-                "UnitType": 0
-            }
+            "Metric": make_empty_metric(0.0, "m", 5),
+            "Imperial": make_empty_metric(0.0, "ft", 0)
         },
 
         "Pressure": {
-            "Metric": {
-                "Value": 1013.0,
-                "Unit": "mb",
-                "UnitType": 14
-            },
-            "Imperial": {
-                "Value": 29.91,
-                "Unit": "inHg",
-                "UnitType": 12
-            }
+            "Metric": make_empty_metric(round(float(pressure_mb), 1), "mb", 14),
+            "Imperial": make_empty_metric(pressure_mb_to_inhg(pressure_mb), "inHg", 12)
         },
 
         "PressureTendency": {
@@ -465,258 +463,128 @@ def safe_current():
         },
 
         "Past24HourTemperatureDeparture": {
-            "Metric": {
-                "Value": 0.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 0.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": make_empty_metric(0.0, "C", 17),
+            "Imperial": make_empty_metric(0.0, "F", 18)
         },
 
         "ApparentTemperature": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": temp_metric,
+            "Imperial": temp_imperial
         },
 
         "WindChillTemperature": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": feels_metric,
+            "Imperial": feels_imperial
         },
 
         "WetBulbTemperature": {
-            "Metric": {
-                "Value": 20.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 68.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
+            "Metric": temp_metric,
+            "Imperial": temp_imperial
         },
 
         "Precip1hr": {
-            "Metric": {
-                "Value": 0.0,
-                "Unit": "mm",
-                "UnitType": 3
-            },
-            "Imperial": {
-                "Value": 0.0,
-                "Unit": "in",
-                "UnitType": 1
-            }
+            "Metric": precip_metric,
+            "Imperial": precip_imperial
         },
 
         "PrecipitationSummary": {
             "Precipitation": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "PastHour": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past3Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past6Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past9Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past12Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past18Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             },
             "Past24Hours": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "in",
-                    "UnitType": 1
-                }
+                "Metric": precip_metric,
+                "Imperial": precip_imperial
             }
         },
 
         "TemperatureSummary": {
             "Past6HourRange": {
                 "Minimum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 },
                 "Maximum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 }
             },
             "Past12HourRange": {
                 "Minimum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 },
                 "Maximum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 }
             },
             "Past24HourRange": {
                 "Minimum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 },
                 "Maximum": {
-                    "Metric": {
-                        "Value": 20.0,
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": 68.0,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
+                    "Metric": temp_metric,
+                    "Imperial": temp_imperial
                 }
             }
         },
 
         "MobileLink": "",
         "Link": ""
-    }]
+    }
+
+
+def safe_current():
+    obj = make_current_object(
+        epoch=int(time.time()),
+        weather_text="Clear",
+        weather_icon=1,
+        is_day=True,
+        temp_c=20.0,
+        feels_c=20.0,
+        humidity=50,
+        pressure_mb=1013,
+        wind_kmh=0.0,
+        wind_deg=0,
+        cloud_cover=0,
+        has_precip=False,
+        precip_type=None,
+        precip_1h=0.0
+    )
+
+    return [obj]
 
 
 def get_current_conditions(lat, lon):
     cache_key = f"current:{lat},{lon}"
     cached = cache_get(cache_key)
+
     if cached:
         return cached
 
@@ -731,7 +599,7 @@ def get_current_conditions(lat, lon):
     data = safe_get(OWM_WEATHER_URL, params)
 
     if str(data.get("cod")) != "200":
-        print("OWM current failed:", data)
+        print("OWM_CURRENT_FAILED:", data, flush=True)
         return safe_current()
 
     weather = (data.get("weather") or [{}])[0]
@@ -739,44 +607,21 @@ def get_current_conditions(lat, lon):
     wind = data.get("wind", {})
     clouds = data.get("clouds", {})
 
-    is_day = is_daytime_by_data(data)
-
-    wid = weather.get("id")
+    weather_id = weather.get("id")
     weather_main = weather.get("main") or "Clear"
-    description = weather.get("description") or weather_main
+    weather_text = weather.get("description") or weather_main
 
-    temp = float(main.get("temp", 20.0))
-    feels = float(main.get("feels_like", temp))
+    temp_c = float(main.get("temp", 20.0))
+    feels_c = float(main.get("feels_like", temp_c))
     humidity = int(main.get("humidity", 50))
-    pressure = float(main.get("pressure", 1013))
-    cloud_cover = int(clouds.get("all", 0))
+    pressure_mb = float(main.get("pressure", 1013))
 
-    wind_speed_ms = float(wind.get("speed", 0.0))
-    wind_speed_kmh = ms_to_kmh(wind_speed_ms)
-    wind_speed_mph = kmh_to_mph(wind_speed_kmh)
+    wind_kmh = ms_to_kmh(float(wind.get("speed", 0.0)))
     wind_deg = int(wind.get("deg", 0))
-    wind_text = wind_direction_text(wind_deg)
 
-    temp_f = c_to_f(temp)
-    feels_f = c_to_f(feels)
-
-    dew_c = round(temp - ((100 - humidity) / 5), 1)
-    dew_f = c_to_f(dew_c)
-
-    epoch = int(data.get("dt", time.time()))
-    now = datetime.now(timezone.utc)
-
-    has_precip = weather_main.lower() in ["rain", "drizzle", "thunderstorm", "snow"]
-
-    precip_type = None
-    if weather_main.lower() == "rain":
-        precip_type = "Rain"
-    elif weather_main.lower() == "snow":
-        precip_type = "Snow"
-    elif weather_main.lower() == "drizzle":
-        precip_type = "Rain"
-    elif weather_main.lower() == "thunderstorm":
-        precip_type = "Rain"
+    cloud_cover = int(clouds.get("all", 0))
+    is_day = is_daytime_by_data(data)
+    icon = htc_icon(weather_id, weather_main, is_day)
 
     rain_1h = 0.0
     snow_1h = 0.0
@@ -791,420 +636,115 @@ def get_current_conditions(lat, lon):
     except Exception:
         snow_1h = 0.0
 
-    precip_1h = round(rain_1h + snow_1h, 1)
+    precip_1h = rain_1h + snow_1h
 
-    result = [{
-        "LocalObservationDateTime": now.isoformat(),
-        "EpochTime": epoch,
-        "WeatherText": description,
-        "WeatherIcon": htc_icon(wid, weather_main, is_day),
-        "HasPrecipitation": has_precip,
-        "PrecipitationType": precip_type,
-        "IsDayTime": is_day,
+    weather_lower = weather_main.lower()
+    has_precip = weather_lower in ["rain", "drizzle", "thunderstorm", "snow"]
 
-        "Temperature": {
-            "Metric": {
-                "Value": round(temp, 1),
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": temp_f,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
+    precip_type = None
 
-        "RealFeelTemperature": {
-            "Metric": {
-                "Value": round(feels, 1),
-                "Unit": "C",
-                "UnitType": 17,
-                "Phrase": ""
-            },
-            "Imperial": {
-                "Value": feels_f,
-                "Unit": "F",
-                "UnitType": 18,
-                "Phrase": ""
-            }
-        },
+    if weather_lower in ["rain", "drizzle", "thunderstorm"]:
+        precip_type = "Rain"
+    elif weather_lower == "snow":
+        precip_type = "Snow"
 
-        "RealFeelTemperatureShade": {
-            "Metric": {
-                "Value": round(feels, 1),
-                "Unit": "C",
-                "UnitType": 17,
-                "Phrase": ""
-            },
-            "Imperial": {
-                "Value": feels_f,
-                "Unit": "F",
-                "UnitType": 18,
-                "Phrase": ""
-            }
-        },
+    obj = make_current_object(
+        epoch=int(data.get("dt", time.time())),
+        weather_text=weather_text,
+        weather_icon=icon,
+        is_day=is_day,
+        temp_c=temp_c,
+        feels_c=feels_c,
+        humidity=humidity,
+        pressure_mb=pressure_mb,
+        wind_kmh=wind_kmh,
+        wind_deg=wind_deg,
+        cloud_cover=cloud_cover,
+        has_precip=has_precip,
+        precip_type=precip_type,
+        precip_1h=precip_1h
+    )
 
-        "RelativeHumidity": humidity,
-        "IndoorRelativeHumidity": humidity,
-
-        "DewPoint": {
-            "Metric": {
-                "Value": dew_c,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": dew_f,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
-
-        "Wind": {
-            "Direction": {
-                "Degrees": wind_deg,
-                "Localized": wind_text,
-                "English": wind_text
-            },
-            "Speed": {
-                "Metric": {
-                    "Value": wind_speed_kmh,
-                    "Unit": "km/h",
-                    "UnitType": 7
-                },
-                "Imperial": {
-                    "Value": wind_speed_mph,
-                    "Unit": "mi/h",
-                    "UnitType": 9
-                }
-            }
-        },
-
-        "WindGust": {
-            "Speed": {
-                "Metric": {
-                    "Value": wind_speed_kmh,
-                    "Unit": "km/h",
-                    "UnitType": 7
-                },
-                "Imperial": {
-                    "Value": wind_speed_mph,
-                    "Unit": "mi/h",
-                    "UnitType": 9
-                }
-            }
-        },
-
-        "UVIndex": 0,
-        "UVIndexText": "Low",
-
-        "Visibility": {
-            "Metric": {
-                "Value": 10.0,
-                "Unit": "km",
-                "UnitType": 6
-            },
-            "Imperial": {
-                "Value": 6.2,
-                "Unit": "mi",
-                "UnitType": 2
-            }
-        },
-
-        "CloudCover": cloud_cover,
-
-        "Ceiling": {
-            "Metric": {
-                "Value": 0.0,
-                "Unit": "m",
-                "UnitType": 5
-            },
-            "Imperial": {
-                "Value": 0.0,
-                "Unit": "ft",
-                "UnitType": 0
-            }
-        },
-
-        "Pressure": {
-            "Metric": {
-                "Value": pressure,
-                "Unit": "mb",
-                "UnitType": 14
-            },
-            "Imperial": {
-                "Value": pressure_mb_to_inhg(pressure),
-                "Unit": "inHg",
-                "UnitType": 12
-            }
-        },
-
-        "PressureTendency": {
-            "LocalizedText": "Steady",
-            "Code": "S"
-        },
-
-        "Past24HourTemperatureDeparture": {
-            "Metric": {
-                "Value": 0.0,
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": 0.0,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
-
-        "ApparentTemperature": {
-            "Metric": {
-                "Value": round(feels, 1),
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": feels_f,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
-
-        "WindChillTemperature": {
-            "Metric": {
-                "Value": round(feels, 1),
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": feels_f,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
-
-        "WetBulbTemperature": {
-            "Metric": {
-                "Value": round(temp, 1),
-                "Unit": "C",
-                "UnitType": 17
-            },
-            "Imperial": {
-                "Value": temp_f,
-                "Unit": "F",
-                "UnitType": 18
-            }
-        },
-
-        "Precip1hr": {
-            "Metric": {
-                "Value": precip_1h,
-                "Unit": "mm",
-                "UnitType": 3
-            },
-            "Imperial": {
-                "Value": round(precip_1h / 25.4, 2),
-                "Unit": "in",
-                "UnitType": 1
-            }
-        },
-
-        "PrecipitationSummary": {
-            "Precipitation": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "PastHour": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past3Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past6Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past9Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past12Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past18Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            },
-            "Past24Hours": {
-                "Metric": {
-                    "Value": precip_1h,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Imperial": {
-                    "Value": round(precip_1h / 25.4, 2),
-                    "Unit": "in",
-                    "UnitType": 1
-                }
-            }
-        },
-
-        "TemperatureSummary": {
-            "Past6HourRange": {
-                "Minimum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                },
-                "Maximum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                }
-            },
-            "Past12HourRange": {
-                "Minimum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                },
-                "Maximum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                }
-            },
-            "Past24HourRange": {
-                "Minimum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                },
-                "Maximum": {
-                    "Metric": {
-                        "Value": round(temp, 1),
-                        "Unit": "C",
-                        "UnitType": 17
-                    },
-                    "Imperial": {
-                        "Value": temp_f,
-                        "Unit": "F",
-                        "UnitType": 18
-                    }
-                }
-            }
-        },
-
-        "MobileLink": "",
-        "Link": ""
-    }]
+    result = [obj]
 
     cache_set(cache_key, result)
     return result
 
 
 # ============================================================
-# DAILY FORECAST 10 DAY
+# DAILY FORECAST
 # ============================================================
+
+def make_daily_day_night(desc, icon, has_precip):
+    return {
+        "Icon": icon,
+        "IconPhrase": desc,
+        "HasPrecipitation": has_precip,
+        "PrecipitationType": "Rain" if has_precip else None,
+        "PrecipitationIntensity": "Light" if has_precip else None,
+        "ShortPhrase": desc,
+        "LongPhrase": desc,
+        "PrecipitationProbability": 30 if has_precip else 0,
+        "ThunderstormProbability": 0,
+        "RainProbability": 30 if has_precip else 0,
+        "SnowProbability": 0,
+        "IceProbability": 0,
+        "Wind": {
+            "Speed": {
+                "Value": 10.0,
+                "Unit": "km/h",
+                "UnitType": 7
+            },
+            "Direction": {
+                "Degrees": 0,
+                "Localized": "N",
+                "English": "N"
+            }
+        },
+        "WindGust": {
+            "Speed": {
+                "Value": 15.0,
+                "Unit": "km/h",
+                "UnitType": 7
+            },
+            "Direction": {
+                "Degrees": 0,
+                "Localized": "N",
+                "English": "N"
+            }
+        },
+        "TotalLiquid": {
+            "Value": 0.0,
+            "Unit": "mm",
+            "UnitType": 3
+        },
+        "Rain": {
+            "Value": 0.0,
+            "Unit": "mm",
+            "UnitType": 3
+        },
+        "Snow": {
+            "Value": 0.0,
+            "Unit": "cm",
+            "UnitType": 4
+        },
+        "Ice": {
+            "Value": 0.0,
+            "Unit": "mm",
+            "UnitType": 3
+        },
+        "HoursOfPrecipitation": 0.0,
+        "HoursOfRain": 0.0,
+        "HoursOfSnow": 0.0,
+        "HoursOfIce": 0.0,
+        "CloudCover": 50
+    }
+
 
 def get_daily_forecast(lat, lon):
     cache_key = f"daily:{lat},{lon}"
     cached = cache_get(cache_key)
+
     if cached:
         return cached
 
@@ -1219,7 +759,7 @@ def get_daily_forecast(lat, lon):
     data = safe_get(OWM_FORECAST_URL, params)
 
     if str(data.get("cod")) != "200":
-        print("OWM daily failed:", data)
+        print("OWM_DAILY_FAILED:", data, flush=True)
         return {
             "Headline": {
                 "EffectiveDate": now_iso(),
@@ -1239,6 +779,7 @@ def get_daily_forecast(lat, lon):
 
     for item in data.get("list", []):
         date = item.get("dt_txt", "").split(" ")[0]
+
         if not date:
             continue
 
@@ -1247,10 +788,9 @@ def get_daily_forecast(lat, lon):
         temp_max = float(item.get("main", {}).get("temp_max", temp))
 
         weather = (item.get("weather") or [{}])[0]
-        wid = weather.get("id")
+        weather_id = weather.get("id")
         main = weather.get("main") or "Clear"
         desc = weather.get("description") or main
-
         epoch = int(item.get("dt", time.time()))
 
         if date not in days:
@@ -1259,7 +799,7 @@ def get_daily_forecast(lat, lon):
                 "max": temp_max,
                 "main": main,
                 "desc": desc,
-                "wid": wid,
+                "weather_id": weather_id,
                 "epoch": epoch
             }
         else:
@@ -1271,30 +811,34 @@ def get_daily_forecast(lat, lon):
     for date, d in list(days.items())[:10]:
         min_c = round(float(d["min"]), 1)
         max_c = round(float(d["max"]), 1)
-        min_f = c_to_f(min_c)
-        max_f = c_to_f(max_c)
 
-        icon_day = htc_icon(d["wid"], d["main"], True)
-        icon_night = htc_icon(d["wid"], d["main"], False)
+        day_icon = htc_icon(d["weather_id"], d["main"], True)
+        night_icon = htc_icon(d["weather_id"], d["main"], False)
+
         has_precip = d["main"].lower() in ["rain", "drizzle", "thunderstorm", "snow"]
 
-        forecasts.append({
+        epoch = int(d["epoch"])
+
+        forecast = {
             "Date": f"{date}T07:00:00+03:00",
-            "EpochDate": int(d["epoch"]),
+            "EpochDate": epoch,
+
             "Sun": {
                 "Rise": f"{date}T05:00:00+03:00",
-                "EpochRise": int(d["epoch"]),
+                "EpochRise": epoch,
                 "Set": f"{date}T20:30:00+03:00",
-                "EpochSet": int(d["epoch"]) + 43200
+                "EpochSet": epoch + 43200
             },
+
             "Moon": {
                 "Rise": f"{date}T20:00:00+03:00",
-                "EpochRise": int(d["epoch"]) + 36000,
+                "EpochRise": epoch + 36000,
                 "Set": f"{date}T06:00:00+03:00",
-                "EpochSet": int(d["epoch"]) + 86400,
+                "EpochSet": epoch + 86400,
                 "Phase": "WaxingCrescent",
                 "Age": 5
             },
+
             "Temperature": {
                 "Minimum": {
                     "Value": min_c,
@@ -1307,6 +851,7 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
+
             "RealFeelTemperature": {
                 "Minimum": {
                     "Value": min_c,
@@ -1319,6 +864,7 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
+
             "RealFeelTemperatureShade": {
                 "Minimum": {
                     "Value": min_c,
@@ -1331,7 +877,9 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
+
             "HoursOfSun": 8.0,
+
             "DegreeDaySummary": {
                 "Heating": {
                     "Value": 0.0,
@@ -1344,140 +892,21 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
+
             "AirAndPollen": [],
-            "Day": {
-                "Icon": icon_day,
-                "IconPhrase": d["desc"],
-                "HasPrecipitation": has_precip,
-                "PrecipitationType": "Rain" if has_precip else None,
-                "PrecipitationIntensity": "Light" if has_precip else None,
-                "ShortPhrase": d["desc"],
-                "LongPhrase": d["desc"],
-                "PrecipitationProbability": 30 if has_precip else 0,
-                "ThunderstormProbability": 0,
-                "RainProbability": 30 if has_precip else 0,
-                "SnowProbability": 0,
-                "IceProbability": 0,
-                "Wind": {
-                    "Speed": {
-                        "Value": 10.0,
-                        "Unit": "km/h",
-                        "UnitType": 7
-                    },
-                    "Direction": {
-                        "Degrees": 0,
-                        "Localized": "N",
-                        "English": "N"
-                    }
-                },
-                "WindGust": {
-                    "Speed": {
-                        "Value": 15.0,
-                        "Unit": "km/h",
-                        "UnitType": 7
-                    },
-                    "Direction": {
-                        "Degrees": 0,
-                        "Localized": "N",
-                        "English": "N"
-                    }
-                },
-                "TotalLiquid": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Rain": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Snow": {
-                    "Value": 0.0,
-                    "Unit": "cm",
-                    "UnitType": 4
-                },
-                "Ice": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "HoursOfPrecipitation": 0.0,
-                "HoursOfRain": 0.0,
-                "HoursOfSnow": 0.0,
-                "HoursOfIce": 0.0,
-                "CloudCover": 50
-            },
-            "Night": {
-                "Icon": icon_night,
-                "IconPhrase": d["desc"],
-                "HasPrecipitation": has_precip,
-                "PrecipitationType": "Rain" if has_precip else None,
-                "PrecipitationIntensity": "Light" if has_precip else None,
-                "ShortPhrase": d["desc"],
-                "LongPhrase": d["desc"],
-                "PrecipitationProbability": 30 if has_precip else 0,
-                "ThunderstormProbability": 0,
-                "RainProbability": 30 if has_precip else 0,
-                "SnowProbability": 0,
-                "IceProbability": 0,
-                "Wind": {
-                    "Speed": {
-                        "Value": 10.0,
-                        "Unit": "km/h",
-                        "UnitType": 7
-                    },
-                    "Direction": {
-                        "Degrees": 0,
-                        "Localized": "N",
-                        "English": "N"
-                    }
-                },
-                "WindGust": {
-                    "Speed": {
-                        "Value": 15.0,
-                        "Unit": "km/h",
-                        "UnitType": 7
-                    },
-                    "Direction": {
-                        "Degrees": 0,
-                        "Localized": "N",
-                        "English": "N"
-                    }
-                },
-                "TotalLiquid": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Rain": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "Snow": {
-                    "Value": 0.0,
-                    "Unit": "cm",
-                    "UnitType": 4
-                },
-                "Ice": {
-                    "Value": 0.0,
-                    "Unit": "mm",
-                    "UnitType": 3
-                },
-                "HoursOfPrecipitation": 0.0,
-                "HoursOfRain": 0.0,
-                "HoursOfSnow": 0.0,
-                "HoursOfIce": 0.0,
-                "CloudCover": 50
-            },
+
+            "Day": make_daily_day_night(d["desc"], day_icon, has_precip),
+            "Night": make_daily_day_night(d["desc"], night_icon, has_precip),
+
             "Sources": ["OpenWeather"],
             "MobileLink": "",
             "Link": ""
-        })
+        }
+
+        forecasts.append(forecast)
 
     while forecasts and len(forecasts) < 10:
-        last = dict(forecasts[-1])
+        last = copy.deepcopy(forecasts[-1])
         last["EpochDate"] = int(last["EpochDate"]) + 86400
         last_date = datetime.fromtimestamp(last["EpochDate"], tz=timezone.utc).date().isoformat()
         last["Date"] = f"{last_date}T07:00:00+03:00"
@@ -1503,12 +932,13 @@ def get_daily_forecast(lat, lon):
 
 
 # ============================================================
-# HOURLY FORECAST 12 HOUR
+# HOURLY FORECAST
 # ============================================================
 
 def get_hourly_forecast(lat, lon):
     cache_key = f"hourly:{lat},{lon}"
     cached = cache_get(cache_key)
+
     if cached:
         return cached
 
@@ -1523,7 +953,7 @@ def get_hourly_forecast(lat, lon):
     data = safe_get(OWM_FORECAST_URL, params)
 
     if str(data.get("cod")) != "200":
-        print("OWM hourly failed:", data)
+        print("OWM_HOURLY_FAILED:", data, flush=True)
         return []
 
     result = []
@@ -1532,45 +962,52 @@ def get_hourly_forecast(lat, lon):
         weather = (item.get("weather") or [{}])[0]
         main = weather.get("main") or "Clear"
         desc = weather.get("description") or main
-        wid = weather.get("id")
+        weather_id = weather.get("id")
 
         temp = float(item.get("main", {}).get("temp", 20.0))
+        humidity = int(item.get("main", {}).get("humidity", 70))
         epoch = int(item.get("dt", time.time()))
 
         dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
         is_day = 6 <= dt.hour <= 20
+
         has_precip = main.lower() in ["rain", "drizzle", "thunderstorm", "snow"]
 
         result.append({
             "DateTime": dt.isoformat(),
             "EpochDateTime": epoch,
-            "WeatherIcon": htc_icon(wid, main, is_day),
+            "WeatherIcon": htc_icon(weather_id, main, is_day),
             "IconPhrase": desc,
             "HasPrecipitation": has_precip,
             "PrecipitationType": "Rain" if has_precip else None,
             "PrecipitationIntensity": "Light" if has_precip else None,
             "IsDaylight": is_day,
+
             "Temperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
+
             "RealFeelTemperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17,
                 "Phrase": ""
             },
+
             "WetBulbTemperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
+
             "DewPoint": {
                 "Value": round(temp - 2, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
+
             "Wind": {
                 "Speed": {
                     "Value": 10.0,
@@ -1583,6 +1020,7 @@ def get_hourly_forecast(lat, lon):
                     "English": "N"
                 }
             },
+
             "WindGust": {
                 "Speed": {
                     "Value": 15.0,
@@ -1590,43 +1028,53 @@ def get_hourly_forecast(lat, lon):
                     "UnitType": 7
                 }
             },
-            "RelativeHumidity": 70,
+
+            "RelativeHumidity": humidity,
+
             "Visibility": {
                 "Value": 10.0,
                 "Unit": "km",
                 "UnitType": 6
             },
+
             "Ceiling": {
                 "Value": 0.0,
                 "Unit": "m",
                 "UnitType": 5
             },
+
             "UVIndex": 0,
             "UVIndexText": "Low",
+
             "PrecipitationProbability": 30 if has_precip else 0,
             "RainProbability": 30 if has_precip else 0,
             "SnowProbability": 0,
             "IceProbability": 0,
+
             "TotalLiquid": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
+
             "Rain": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
+
             "Snow": {
                 "Value": 0.0,
                 "Unit": "cm",
                 "UnitType": 4
             },
+
             "Ice": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
+
             "CloudCover": 50,
             "MobileLink": "",
             "Link": ""
@@ -1649,6 +1097,7 @@ def home():
 def debug():
     return jsonify({
         "status": "ok",
+        "version": PROXY_VERSION,
         "openweather_key_present": bool(OPENWEATHER_API_KEY),
         "routes": [
             "/locations/v1/cities/geoposition/search",
@@ -1692,9 +1141,7 @@ def location_search():
 
 @app.route("/locations/v1/timezones")
 def timezones():
-    return jsonify([
-        accu_timezone()
-    ])
+    return jsonify([accu_timezone()])
 
 
 @app.route("/locations/v1/<path:location_key>")
@@ -1740,7 +1187,11 @@ def city_find_asp():
     )
 
     results = search_locations_by_text(q)
-    first = results[0] if results else accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA")
+
+    if results:
+        first = results[0]
+    else:
+        first = accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA")
 
     name = first.get("LocalizedName", "Kyiv")
     country = first.get("Country", {}).get("ID", "UA")
