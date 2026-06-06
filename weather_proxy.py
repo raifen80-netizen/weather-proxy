@@ -1,20 +1,24 @@
 from flask import Flask, request, jsonify
 import requests
+import os
 
 app = Flask(__name__)
 
 # =========================
-# CONFIG
+# CONFIG (SAFE)
 # =========================
 
-OPENWEATHER_KEY = "PUT_YOUR_OPENWEATHER_KEY_HERE"
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
+
+BASE_URL = "https://api.openweathermap.org/data/2.5"
+
 
 # =========================
 # HELPERS
 # =========================
 
 def owm_geocode(lat, lon):
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+    url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
 
@@ -26,25 +30,26 @@ def owm_geocode(lat, lon):
 
 
 def owm_current(lat, lon):
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+    url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
 
-    weather = data.get("weather", [{}])[0]
+    weather = (data.get("weather") or [{}])[0]
+    main = data.get("main", {})
 
     return [{
         "WeatherText": weather.get("main", "Clear"),
         "WeatherIcon": 1,
         "Temperature": {
             "Metric": {
-                "Value": data.get("main", {}).get("temp", 20)
+                "Value": main.get("temp", 20)
             }
         }
     }]
 
 
 def owm_forecast(lat, lon):
-    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+    url = f"{BASE_URL}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
 
@@ -53,21 +58,17 @@ def owm_forecast(lat, lon):
     for item in data.get("list", []):
         date = item["dt_txt"].split(" ")[0]
         temp = item["main"]["temp"]
-        weather = item["weather"][0]["main"]
+        text = item["weather"][0]["main"]
 
         if date not in daily:
-            daily[date] = {
-                "min": temp,
-                "max": temp,
-                "text": weather
-            }
+            daily[date] = {"min": temp, "max": temp, "text": text}
         else:
             daily[date]["min"] = min(daily[date]["min"], temp)
             daily[date]["max"] = max(daily[date]["max"], temp)
 
     forecasts = []
 
-    for i, (date, v) in enumerate(list(daily.items())[:5]):
+    for date, v in list(daily.items())[:5]:
         forecasts.append({
             "Date": date,
             "Day": {
@@ -86,6 +87,11 @@ def owm_forecast(lat, lon):
 # =========================
 # HTC ENDPOINTS
 # =========================
+
+@app.route("/")
+def index():
+    return "HTC Weather Proxy OK"
+
 
 @app.route("/locations/v1/cities/geoposition/search")
 def geoposition_search():
@@ -114,18 +120,9 @@ def forecast(key):
     try:
         lat, lon = key.split(",")
     except:
-        lat, lon = "0", "0"
+        lat, lon = "0,0"
 
     return jsonify(owm_forecast(lat, lon))
-
-
-# =========================
-# HEALTH CHECK
-# =========================
-
-@app.route("/")
-def index():
-    return "HTC Weather Proxy OK"
 
 
 # =========================
