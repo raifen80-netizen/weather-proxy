@@ -16,8 +16,8 @@ BASE_URL = "https://api.openweathermap.org/data/2.5"
 # SAFETY CHECK
 # =========================
 
-if not OPENWEATHER_KEY:
-    print("WARNING: OPENWEATHER_API_KEY is not set!")
+def owm_ok(data):
+    return isinstance(data, dict) and str(data.get("cod")) == "200"
 
 
 # =========================
@@ -29,18 +29,17 @@ def geocode(lat, lon):
     r = requests.get(url, timeout=10)
     data = r.json()
 
-    # error handling
-    if data.get("cod") not in [200, 200.0, "200"]:
+    if not owm_ok(data):
         return {
             "Key": f"{lat},{lon}",
-            "LocalizedName": "Unknown",
-            "Country": ""
+            "LocalizedName": "Kyiv",
+            "Country": "UA"
         }
 
     return {
         "Key": f"{lat},{lon}",
-        "LocalizedName": data.get("name") or "Unknown",
-        "Country": data.get("sys", {}).get("country") or ""
+        "LocalizedName": data.get("name") or "Kyiv",
+        "Country": data.get("sys", {}).get("country") or "UA"
     }
 
 
@@ -53,7 +52,7 @@ def current_conditions(lat, lon):
     r = requests.get(url, timeout=10)
     data = r.json()
 
-    if data.get("cod") != 200:
+    if not owm_ok(data):
         return [{
             "WeatherText": "Clear",
             "WeatherIcon": 1,
@@ -85,7 +84,7 @@ def forecast(lat, lon):
     r = requests.get(url, timeout=10)
     data = r.json()
 
-    if data.get("cod") not in ["200", 200]:
+    if not owm_ok(data):
         return {"DailyForecasts": []}
 
     daily = {}
@@ -96,7 +95,11 @@ def forecast(lat, lon):
         text = item["weather"][0]["main"]
 
         if date not in daily:
-            daily[date] = {"min": temp, "max": temp, "text": text}
+            daily[date] = {
+                "min": temp,
+                "max": temp,
+                "text": text
+            }
         else:
             daily[date]["min"] = min(daily[date]["min"], temp)
             daily[date]["max"] = max(daily[date]["max"], temp)
@@ -128,7 +131,6 @@ def index():
     return "HTC Weather Proxy OK"
 
 
-# --- SEARCH ---
 @app.route("/locations/v1/cities/geoposition/search")
 def search():
     q = request.args.get("q", "0,0")
@@ -141,7 +143,6 @@ def search():
     return jsonify([geocode(lat, lon)])
 
 
-# --- CURRENT ---
 @app.route("/currentconditions/v1/<key>")
 def current(key):
     try:
@@ -152,7 +153,6 @@ def current(key):
     return jsonify(current_conditions(lat, lon))
 
 
-# --- FORECAST ---
 @app.route("/forecasts/v1/daily/5day/<key>")
 def daily(key):
     try:
@@ -164,7 +164,7 @@ def daily(key):
 
 
 # =========================
-# RUN SERVER
+# RUN
 # =========================
 
 if __name__ == "__main__":
