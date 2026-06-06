@@ -13,23 +13,48 @@ BASE_URL = "https://api.openweathermap.org/data/2.5"
 
 
 # =========================
-# SAFETY CHECK
+# ICON MAPPING (HTC STYLE)
 # =========================
 
-def owm_ok(data):
-    return isinstance(data, dict) and str(data.get("cod")) == "200"
+def map_icon(main):
+    main = (main or "").lower()
+
+    if "thunder" in main or "storm" in main:
+        return 15
+    if "rain" in main or "drizzle" in main:
+        return 12
+    if "snow" in main:
+        return 22
+    if "cloud" in main:
+        return 7
+    if "clear" in main or "sun" in main:
+        return 1
+
+    return 7
 
 
 # =========================
-# GEOCODE (HTC SEARCH)
+# SAFE REQUEST
+# =========================
+
+def safe_get(url):
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        return data
+    except:
+        return {}
+
+
+# =========================
+# GEOPOSITION SEARCH (HTC)
 # =========================
 
 def geocode(lat, lon):
     url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    r = requests.get(url, timeout=10)
-    data = r.json()
+    data = safe_get(url)
 
-    if not owm_ok(data):
+    if str(data.get("cod")) != "200":
         return {
             "Key": f"{lat},{lon}",
             "LocalizedName": "Kyiv",
@@ -44,15 +69,14 @@ def geocode(lat, lon):
 
 
 # =========================
-# CURRENT CONDITIONS
+# CURRENT CONDITIONS (HTC CORE)
 # =========================
 
 def current_conditions(lat, lon):
     url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    r = requests.get(url, timeout=10)
-    data = r.json()
+    data = safe_get(url)
 
-    if not owm_ok(data):
+    if str(data.get("cod")) != "200":
         return [{
             "WeatherText": "Clear",
             "WeatherIcon": 1,
@@ -66,7 +90,7 @@ def current_conditions(lat, lon):
 
     return [{
         "WeatherText": weather.get("main", "Clear"),
-        "WeatherIcon": 1,
+        "WeatherIcon": map_icon(weather.get("main")),
         "Temperature": {
             "Metric": {
                 "Value": main.get("temp", 20)
@@ -76,15 +100,14 @@ def current_conditions(lat, lon):
 
 
 # =========================
-# FORECAST (5 DAY)
+# FORECAST (HTC 5-DAY STYLE)
 # =========================
 
 def forecast(lat, lon):
     url = f"{BASE_URL}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
-    r = requests.get(url, timeout=10)
-    data = r.json()
+    data = safe_get(url)
 
-    if not owm_ok(data):
+    if str(data.get("cod")) != "200":
         return {"DailyForecasts": []}
 
     daily = {}
@@ -110,7 +133,7 @@ def forecast(lat, lon):
         result.append({
             "Date": date,
             "Day": {
-                "Icon": 1,
+                "Icon": map_icon(v["text"]),
                 "IconPhrase": v["text"]
             },
             "Temperature": {
@@ -123,7 +146,7 @@ def forecast(lat, lon):
 
 
 # =========================
-# ENDPOINTS (HTC COMPATIBLE)
+# ENDPOINTS
 # =========================
 
 @app.route("/")
