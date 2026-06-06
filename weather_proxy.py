@@ -5,34 +5,62 @@ import os
 app = Flask(__name__)
 
 # =========================
-# CONFIG (SAFE)
+# CONFIG
 # =========================
 
-OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
-
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
 BASE_URL = "https://api.openweathermap.org/data/2.5"
 
 
 # =========================
-# HELPERS
+# SAFETY CHECK
 # =========================
 
-def owm_geocode(lat, lon):
+if not OPENWEATHER_KEY:
+    print("WARNING: OPENWEATHER_API_KEY is not set!")
+
+
+# =========================
+# GEOCODE (HTC SEARCH)
+# =========================
+
+def geocode(lat, lon):
     url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
+
+    # error handling
+    if data.get("cod") not in [200, 200.0, "200"]:
+        return {
+            "Key": f"{lat},{lon}",
+            "LocalizedName": "Unknown",
+            "Country": ""
+        }
 
     return {
         "Key": f"{lat},{lon}",
-        "LocalizedName": data.get("name", "Unknown"),
-        "Country": data.get("sys", {}).get("country", "")
+        "LocalizedName": data.get("name") or "Unknown",
+        "Country": data.get("sys", {}).get("country") or ""
     }
 
 
-def owm_current(lat, lon):
+# =========================
+# CURRENT CONDITIONS
+# =========================
+
+def current_conditions(lat, lon):
     url = f"{BASE_URL}/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
+
+    if data.get("cod") != 200:
+        return [{
+            "WeatherText": "Clear",
+            "WeatherIcon": 1,
+            "Temperature": {
+                "Metric": {"Value": 20}
+            }
+        }]
 
     weather = (data.get("weather") or [{}])[0]
     main = data.get("main", {})
@@ -48,10 +76,17 @@ def owm_current(lat, lon):
     }]
 
 
-def owm_forecast(lat, lon):
+# =========================
+# FORECAST (5 DAY)
+# =========================
+
+def forecast(lat, lon):
     url = f"{BASE_URL}/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     r = requests.get(url, timeout=10)
     data = r.json()
+
+    if data.get("cod") not in ["200", 200]:
+        return {"DailyForecasts": []}
 
     daily = {}
 
@@ -66,10 +101,10 @@ def owm_forecast(lat, lon):
             daily[date]["min"] = min(daily[date]["min"], temp)
             daily[date]["max"] = max(daily[date]["max"], temp)
 
-    forecasts = []
+    result = []
 
     for date, v in list(daily.items())[:5]:
-        forecasts.append({
+        result.append({
             "Date": date,
             "Day": {
                 "Icon": 1,
@@ -81,11 +116,11 @@ def owm_forecast(lat, lon):
             }
         })
 
-    return {"DailyForecasts": forecasts}
+    return {"DailyForecasts": result}
 
 
 # =========================
-# HTC ENDPOINTS
+# ENDPOINTS (HTC COMPATIBLE)
 # =========================
 
 @app.route("/")
@@ -93,8 +128,9 @@ def index():
     return "HTC Weather Proxy OK"
 
 
+# --- SEARCH ---
 @app.route("/locations/v1/cities/geoposition/search")
-def geoposition_search():
+def search():
     q = request.args.get("q", "0,0")
 
     try:
@@ -102,31 +138,33 @@ def geoposition_search():
     except:
         lat, lon = "0", "0"
 
-    return jsonify([owm_geocode(lat, lon)])
+    return jsonify([geocode(lat, lon)])
 
 
+# --- CURRENT ---
 @app.route("/currentconditions/v1/<key>")
-def current_conditions(key):
+def current(key):
     try:
         lat, lon = key.split(",")
     except:
         lat, lon = "0", "0"
 
-    return jsonify(owm_current(lat, lon))
+    return jsonify(current_conditions(lat, lon))
 
 
+# --- FORECAST ---
 @app.route("/forecasts/v1/daily/5day/<key>")
-def forecast(key):
+def daily(key):
     try:
         lat, lon = key.split(",")
     except:
-        lat, lon = "0,0"
+        lat, lon = "0", "0"
 
-    return jsonify(owm_forecast(lat, lon))
+    return jsonify(forecast(lat, lon))
 
 
 # =========================
-# RUN
+# RUN SERVER
 # =========================
 
 if __name__ == "__main__":
