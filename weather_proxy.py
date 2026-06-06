@@ -13,7 +13,8 @@ try:
 except Exception:
     pass
 
-PROXY_VERSION = "htc-full-current-v3-2026-06-06"
+
+PROXY_VERSION = "htc-full-current-v4-key-underscore-2026-06-06"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
@@ -26,7 +27,7 @@ CACHE_TTL = 300
 
 
 # ============================================================
-# LOG EVERY HTC REQUEST
+# LOG EVERY REQUEST
 # ============================================================
 
 @app.before_request
@@ -86,16 +87,34 @@ def now_iso():
 
 def parse_key(location_key):
     """
-    Наш AccuWeather Location Key = координаты:
-    50.4501,30.5234
+    HTC/AccuWeather Location Key у нас хранит координаты.
+
+    Новый безопасный формат:
+    47.694_33.268
+
+    Старый формат тоже поддерживаем:
+    47.694,33.268
     """
     try:
         key = str(location_key).strip()
+
+        if key.endswith(".json"):
+            key = key[:-5]
+
         key = key.replace("%2C", ",").replace("%2c", ",")
-        lat, lon = key.split(",", 1)
-        return lat.strip(), lon.strip()
+        key = key.replace("%5F", "_").replace("%5f", "_")
+
+        if "_" in key:
+            lat, lon = key.split("_", 1)
+            return lat.strip(), lon.strip()
+
+        if "," in key:
+            lat, lon = key.split(",", 1)
+            return lat.strip(), lon.strip()
+
+        return "47.694", "33.268"
     except Exception:
-        return "50.4501", "30.5234"
+        return "47.694", "33.268"
 
 
 def c_to_f(c):
@@ -192,7 +211,12 @@ def accu_timezone():
 def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
     lat_f = float(lat)
     lon_f = float(lon)
-    key = f"{lat},{lon}"
+
+    # ВАЖНО:
+    # Не используем запятую в Key.
+    # HTC может получить location, но не пойти дальше на currentconditions,
+    # если Key содержит запятую.
+    key = f"{lat}_{lon}"
 
     return {
         "Version": 1,
@@ -302,19 +326,21 @@ def search_locations_by_text(query):
 
     if isinstance(data, list) and data:
         for item in data:
-            lat = str(item.get("lat", "50.4501"))
-            lon = str(item.get("lon", "30.5234"))
+            lat = str(item.get("lat", "47.694"))
+            lon = str(item.get("lon", "33.268"))
+
             name = (
                 item.get("local_names", {}).get("ru")
                 or item.get("local_names", {}).get("uk")
                 or item.get("name")
                 or query
             )
+
             country = item.get("country") or "UA"
             result.append(accuweather_location_object(lat, lon, name, country))
     else:
         result.append(
-            accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA")
+            accuweather_location_object("47.694", "33.268", "Широке", "UA")
         )
 
     cache_set(cache_key, result)
@@ -325,7 +351,7 @@ def search_locations_by_text(query):
 # CURRENT CONDITIONS
 # ============================================================
 
-def make_empty_metric(value, unit="C", unit_type=17):
+def unit_value(value, unit, unit_type):
     return {
         "Value": value,
         "Unit": unit,
@@ -351,10 +377,13 @@ def make_current_object(
 ):
     temp_c = round(float(temp_c), 1)
     feels_c = round(float(feels_c), 1)
+
     temp_f = c_to_f(temp_c)
     feels_f = c_to_f(feels_c)
 
-    dew_c = round(temp_c - ((100 - int(humidity)) / 5), 1)
+    humidity = int(humidity)
+
+    dew_c = round(temp_c - ((100 - humidity) / 5), 1)
     dew_f = c_to_f(dew_c)
 
     wind_kmh = round(float(wind_kmh), 1)
@@ -364,8 +393,8 @@ def make_current_object(
     precip_1h = round(float(precip_1h), 1)
     precip_in = round(precip_1h / 25.4, 2)
 
-    temp_metric = make_empty_metric(temp_c, "C", 17)
-    temp_imperial = make_empty_metric(temp_f, "F", 18)
+    temp_metric = unit_value(temp_c, "C", 17)
+    temp_imperial = unit_value(temp_f, "F", 18)
 
     feels_metric = {
         "Value": feels_c,
@@ -381,8 +410,8 @@ def make_current_object(
         "Phrase": ""
     }
 
-    precip_metric = make_empty_metric(precip_1h, "mm", 3)
-    precip_imperial = make_empty_metric(precip_in, "in", 1)
+    precip_metric = unit_value(precip_1h, "mm", 3)
+    precip_imperial = unit_value(precip_in, "in", 1)
 
     return {
         "LocalObservationDateTime": now_iso(),
@@ -409,12 +438,12 @@ def make_current_object(
             "Imperial": feels_imperial
         },
 
-        "RelativeHumidity": int(humidity),
-        "IndoorRelativeHumidity": int(humidity),
+        "RelativeHumidity": humidity,
+        "IndoorRelativeHumidity": humidity,
 
         "DewPoint": {
-            "Metric": make_empty_metric(dew_c, "C", 17),
-            "Imperial": make_empty_metric(dew_f, "F", 18)
+            "Metric": unit_value(dew_c, "C", 17),
+            "Imperial": unit_value(dew_f, "F", 18)
         },
 
         "Wind": {
@@ -424,15 +453,15 @@ def make_current_object(
                 "English": wind_text
             },
             "Speed": {
-                "Metric": make_empty_metric(wind_kmh, "km/h", 7),
-                "Imperial": make_empty_metric(wind_mph, "mi/h", 9)
+                "Metric": unit_value(wind_kmh, "km/h", 7),
+                "Imperial": unit_value(wind_mph, "mi/h", 9)
             }
         },
 
         "WindGust": {
             "Speed": {
-                "Metric": make_empty_metric(wind_kmh, "km/h", 7),
-                "Imperial": make_empty_metric(wind_mph, "mi/h", 9)
+                "Metric": unit_value(wind_kmh, "km/h", 7),
+                "Imperial": unit_value(wind_mph, "mi/h", 9)
             }
         },
 
@@ -440,21 +469,21 @@ def make_current_object(
         "UVIndexText": "Low",
 
         "Visibility": {
-            "Metric": make_empty_metric(10.0, "km", 6),
-            "Imperial": make_empty_metric(6.2, "mi", 2)
+            "Metric": unit_value(10.0, "km", 6),
+            "Imperial": unit_value(6.2, "mi", 2)
         },
 
         "ObstructionsToVisibility": "",
         "CloudCover": int(cloud_cover),
 
         "Ceiling": {
-            "Metric": make_empty_metric(0.0, "m", 5),
-            "Imperial": make_empty_metric(0.0, "ft", 0)
+            "Metric": unit_value(0.0, "m", 5),
+            "Imperial": unit_value(0.0, "ft", 0)
         },
 
         "Pressure": {
-            "Metric": make_empty_metric(round(float(pressure_mb), 1), "mb", 14),
-            "Imperial": make_empty_metric(pressure_mb_to_inhg(pressure_mb), "inHg", 12)
+            "Metric": unit_value(round(float(pressure_mb), 1), "mb", 14),
+            "Imperial": unit_value(pressure_mb_to_inhg(pressure_mb), "inHg", 12)
         },
 
         "PressureTendency": {
@@ -463,8 +492,8 @@ def make_current_object(
         },
 
         "Past24HourTemperatureDeparture": {
-            "Metric": make_empty_metric(0.0, "C", 17),
-            "Imperial": make_empty_metric(0.0, "F", 18)
+            "Metric": unit_value(0.0, "C", 17),
+            "Imperial": unit_value(0.0, "F", 18)
         },
 
         "ApparentTemperature": {
@@ -561,24 +590,24 @@ def make_current_object(
 
 
 def safe_current():
-    obj = make_current_object(
-        epoch=int(time.time()),
-        weather_text="Clear",
-        weather_icon=1,
-        is_day=True,
-        temp_c=20.0,
-        feels_c=20.0,
-        humidity=50,
-        pressure_mb=1013,
-        wind_kmh=0.0,
-        wind_deg=0,
-        cloud_cover=0,
-        has_precip=False,
-        precip_type=None,
-        precip_1h=0.0
-    )
-
-    return [obj]
+    return [
+        make_current_object(
+            epoch=int(time.time()),
+            weather_text="Clear",
+            weather_icon=1,
+            is_day=True,
+            temp_c=20.0,
+            feels_c=20.0,
+            humidity=50,
+            pressure_mb=1013,
+            wind_kmh=0.0,
+            wind_deg=0,
+            cloud_cover=0,
+            has_precip=False,
+            precip_type=None,
+            precip_1h=0.0
+        )
+    ]
 
 
 def get_current_conditions(lat, lon):
@@ -648,24 +677,24 @@ def get_current_conditions(lat, lon):
     elif weather_lower == "snow":
         precip_type = "Snow"
 
-    obj = make_current_object(
-        epoch=int(data.get("dt", time.time())),
-        weather_text=weather_text,
-        weather_icon=icon,
-        is_day=is_day,
-        temp_c=temp_c,
-        feels_c=feels_c,
-        humidity=humidity,
-        pressure_mb=pressure_mb,
-        wind_kmh=wind_kmh,
-        wind_deg=wind_deg,
-        cloud_cover=cloud_cover,
-        has_precip=has_precip,
-        precip_type=precip_type,
-        precip_1h=precip_1h
-    )
-
-    result = [obj]
+    result = [
+        make_current_object(
+            epoch=int(data.get("dt", time.time())),
+            weather_text=weather_text,
+            weather_icon=icon,
+            is_day=is_day,
+            temp_c=temp_c,
+            feels_c=feels_c,
+            humidity=humidity,
+            pressure_mb=pressure_mb,
+            wind_kmh=wind_kmh,
+            wind_deg=wind_deg,
+            cloud_cover=cloud_cover,
+            has_precip=has_precip,
+            precip_type=precip_type,
+            precip_1h=precip_1h
+        )
+    ]
 
     cache_set(cache_key, result)
     return result
@@ -816,20 +845,17 @@ def get_daily_forecast(lat, lon):
         night_icon = htc_icon(d["weather_id"], d["main"], False)
 
         has_precip = d["main"].lower() in ["rain", "drizzle", "thunderstorm", "snow"]
-
         epoch = int(d["epoch"])
 
         forecast = {
             "Date": f"{date}T07:00:00+03:00",
             "EpochDate": epoch,
-
             "Sun": {
                 "Rise": f"{date}T05:00:00+03:00",
                 "EpochRise": epoch,
                 "Set": f"{date}T20:30:00+03:00",
                 "EpochSet": epoch + 43200
             },
-
             "Moon": {
                 "Rise": f"{date}T20:00:00+03:00",
                 "EpochRise": epoch + 36000,
@@ -838,7 +864,6 @@ def get_daily_forecast(lat, lon):
                 "Phase": "WaxingCrescent",
                 "Age": 5
             },
-
             "Temperature": {
                 "Minimum": {
                     "Value": min_c,
@@ -851,7 +876,6 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
-
             "RealFeelTemperature": {
                 "Minimum": {
                     "Value": min_c,
@@ -864,7 +888,6 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
-
             "RealFeelTemperatureShade": {
                 "Minimum": {
                     "Value": min_c,
@@ -877,9 +900,7 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
-
             "HoursOfSun": 8.0,
-
             "DegreeDaySummary": {
                 "Heating": {
                     "Value": 0.0,
@@ -892,12 +913,9 @@ def get_daily_forecast(lat, lon):
                     "UnitType": 17
                 }
             },
-
             "AirAndPollen": [],
-
             "Day": make_daily_day_night(d["desc"], day_icon, has_precip),
             "Night": make_daily_day_night(d["desc"], night_icon, has_precip),
-
             "Sources": ["OpenWeather"],
             "MobileLink": "",
             "Link": ""
@@ -982,32 +1000,27 @@ def get_hourly_forecast(lat, lon):
             "PrecipitationType": "Rain" if has_precip else None,
             "PrecipitationIntensity": "Light" if has_precip else None,
             "IsDaylight": is_day,
-
             "Temperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
-
             "RealFeelTemperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17,
                 "Phrase": ""
             },
-
             "WetBulbTemperature": {
                 "Value": round(temp, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
-
             "DewPoint": {
                 "Value": round(temp - 2, 1),
                 "Unit": "C",
                 "UnitType": 17
             },
-
             "Wind": {
                 "Speed": {
                     "Value": 10.0,
@@ -1020,7 +1033,6 @@ def get_hourly_forecast(lat, lon):
                     "English": "N"
                 }
             },
-
             "WindGust": {
                 "Speed": {
                     "Value": 15.0,
@@ -1028,53 +1040,43 @@ def get_hourly_forecast(lat, lon):
                     "UnitType": 7
                 }
             },
-
             "RelativeHumidity": humidity,
-
             "Visibility": {
                 "Value": 10.0,
                 "Unit": "km",
                 "UnitType": 6
             },
-
             "Ceiling": {
                 "Value": 0.0,
                 "Unit": "m",
                 "UnitType": 5
             },
-
             "UVIndex": 0,
             "UVIndexText": "Low",
-
             "PrecipitationProbability": 30 if has_precip else 0,
             "RainProbability": 30 if has_precip else 0,
             "SnowProbability": 0,
             "IceProbability": 0,
-
             "TotalLiquid": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
-
             "Rain": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
-
             "Snow": {
                 "Value": 0.0,
                 "Unit": "cm",
                 "UnitType": 4
             },
-
             "Ice": {
                 "Value": 0.0,
                 "Unit": "mm",
                 "UnitType": 3
             },
-
             "CloudCover": 50,
             "MobileLink": "",
             "Link": ""
@@ -1117,12 +1119,12 @@ def debug():
 @app.route("/locations/v1/cities/geoposition/search")
 @app.route("/locations/v1/cities/geoposition/search.json")
 def geoposition_search():
-    q = request.args.get("q") or request.args.get("query") or "50.4501,30.5234"
+    q = request.args.get("q") or request.args.get("query") or "47.694,33.268"
 
     try:
         lat, lon = q.split(",", 1)
     except Exception:
-        lat, lon = "50.4501", "30.5234"
+        lat, lon = "47.694", "33.268"
 
     return jsonify(get_location_by_coords(lat.strip(), lon.strip()))
 
@@ -1133,7 +1135,7 @@ def location_search():
         request.args.get("q")
         or request.args.get("query")
         or request.args.get("city")
-        or "Kyiv"
+        or "Широке"
     )
 
     return jsonify(search_locations_by_text(q))
@@ -1183,7 +1185,7 @@ def city_find_asp():
         or request.args.get("q")
         or request.args.get("query")
         or request.args.get("city")
-        or "Kyiv"
+        or "Широке"
     )
 
     results = search_locations_by_text(q)
@@ -1191,13 +1193,13 @@ def city_find_asp():
     if results:
         first = results[0]
     else:
-        first = accuweather_location_object("50.4501", "30.5234", "Kyiv", "UA")
+        first = accuweather_location_object("47.694", "33.268", "Широке", "UA")
 
-    name = first.get("LocalizedName", "Kyiv")
+    name = first.get("LocalizedName", "Широке")
     country = first.get("Country", {}).get("ID", "UA")
     geo = first.get("GeoPosition", {})
-    lat = geo.get("Latitude", 50.4501)
-    lon = geo.get("Longitude", 30.5234)
+    lat = geo.get("Latitude", 47.694)
+    lon = geo.get("Longitude", 33.268)
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <adc_database>
