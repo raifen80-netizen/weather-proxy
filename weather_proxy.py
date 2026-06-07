@@ -3,6 +3,7 @@ import requests
 import os
 import time
 import copy
+import re
 from datetime import datetime, timezone
 
 app = Flask(__name__)
@@ -14,7 +15,7 @@ except Exception:
     pass
 
 
-PROXY_VERSION = "htc-full-current-v5-geoposition-text-2026-06-06"
+PROXY_VERSION = "htc-full-current-v6-numeric-key-2026-06-07"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
@@ -39,12 +40,10 @@ def log_request():
 
 def cache_get(key):
     item = CACHE.get(key)
-
     if not item:
         return None
 
     data, ts = item
-
     if time.time() - ts < CACHE_TTL:
         return data
 
@@ -69,7 +68,33 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def make_location_key(lat, lon):
+    """
+    Безопасный HTC/AccuWeather-like ключ.
+
+    Пример:
+    47.6846511, 33.2645369
+    -> KP0476847E0332645
+    """
+    lat_f = float(lat)
+    lon_f = float(lon)
+
+    lat_sign = "P" if lat_f >= 0 else "M"
+    lon_sign = "E" if lon_f >= 0 else "W"
+
+    lat_num = int(round(abs(lat_f) * 10000))
+    lon_num = int(round(abs(lon_f) * 10000))
+
+    return f"K{lat_sign}{lat_num:07d}{lon_sign}{lon_num:07d}"
+
+
 def parse_key(location_key):
+    """
+    Поддерживает:
+    KP0476847E0332645
+    47.6846511_33.2645369
+    47.6846511,33.2645369
+    """
     try:
         key = str(location_key).strip()
 
@@ -79,6 +104,21 @@ def parse_key(location_key):
         key = key.replace("%2C", ",").replace("%2c", ",")
         key = key.replace("%5F", "_").replace("%5f", "_")
 
+        m = re.match(r"^K([PM])(\d{7})([EW])(\d{7})$", key)
+        if m:
+            lat_sign, lat_raw, lon_sign, lon_raw = m.groups()
+
+            lat = int(lat_raw) / 10000.0
+            lon = int(lon_raw) / 10000.0
+
+            if lat_sign == "M":
+                lat = -lat
+
+            if lon_sign == "W":
+                lon = -lon
+
+            return str(lat), str(lon)
+
         if "_" in key:
             lat, lon = key.split("_", 1)
             return lat.strip(), lon.strip()
@@ -87,9 +127,10 @@ def parse_key(location_key):
             lat, lon = key.split(",", 1)
             return lat.strip(), lon.strip()
 
-        return "47.694", "33.268"
+        return "47.6847", "33.2645"
+
     except Exception:
-        return "47.694", "33.268"
+        return "47.6847", "33.2645"
 
 
 def c_to_f(c):
@@ -187,9 +228,7 @@ def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
     lat_f = float(lat)
     lon_f = float(lon)
 
-    # Важно: Key без запятой.
-    # Старый HTC может не идти дальше на currentconditions, если Key содержит запятую.
-    key = f"{lat}_{lon}"
+    key = make_location_key(lat_f, lon_f)
 
     return {
         "Version": 1,
@@ -295,8 +334,8 @@ def search_locations_by_text(query):
 
     if isinstance(data, list) and data:
         for item in data:
-            lat = str(item.get("lat", "47.694"))
-            lon = str(item.get("lon", "33.268"))
+            lat = str(item.get("lat", "47.6847"))
+            lon = str(item.get("lon", "33.2645"))
 
             name = (
                 item.get("local_names", {}).get("ru")
@@ -309,7 +348,7 @@ def search_locations_by_text(query):
             result.append(accuweather_location_object(lat, lon, name, country))
     else:
         result.append(
-            accuweather_location_object("47.694", "33.268", "Широке", "UA")
+            accuweather_location_object("47.6847", "33.2645", "Широке", "UA")
         )
 
     cache_set(cache_key, result)
@@ -381,7 +420,6 @@ def make_current_object(
     return {
         "LocalObservationDateTime": now_iso(),
         "EpochTime": int(epoch),
-
         "WeatherText": weather_text,
         "WeatherIcon": int(weather_icon),
         "HasPrecipitation": bool(has_precip),
@@ -1072,26 +1110,22 @@ def debug():
 @app.route("/locations/v1/cities/geoposition/search")
 @app.route("/locations/v1/cities/geoposition/search.json")
 def geoposition_search():
-    q = request.args.get("q") or request.args.get("query") or "47.694,33.268"
+    q = request.args.get("q") or request.args.get("query") or "47.6847,33.2645"
     q = str(q).strip()
 
-    # Вариант 1: HTC передал координаты
-    # Например: q=47.694,33.268
     if "," in q:
         try:
             lat, lon = q.split(",", 1)
             return jsonify(get_location_by_coords(lat.strip(), lon.strip()))
         except Exception:
-            return jsonify(get_location_by_coords("47.694", "33.268"))
+            return jsonify(get_location_by_coords("47.6847", "33.2645"))
 
-    # Вариант 2: HTC почему-то передал текст города
-    # Например: q=kyiv
     results = search_locations_by_text(q)
 
     if results:
         return jsonify(results[0])
 
-    return jsonify(get_location_by_coords("47.694", "33.268"))
+    return jsonify(get_location_by_coords("47.6847", "33.2645"))
 
 
 @app.route("/locations/v1/search")
@@ -1158,13 +1192,13 @@ def city_find_asp():
     if results:
         first = results[0]
     else:
-        first = accuweather_location_object("47.694", "33.268", "Широке", "UA")
+        first = accuweather_location_object("47.6847", "33.2645", "Широке", "UA")
 
     name = first.get("LocalizedName", "Широке")
     country = first.get("Country", {}).get("ID", "UA")
     geo = first.get("GeoPosition", {})
-    lat = geo.get("Latitude", 47.694)
-    lon = geo.get("Longitude", 33.268)
+    lat = geo.get("Latitude", 47.6847)
+    lon = geo.get("Longitude", 33.2645)
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <adc_database>
