@@ -15,7 +15,7 @@ except Exception:
     pass
 
 
-PROXY_VERSION = "htc-full-current-v6-numeric-key-2026-06-07"
+PROXY_VERSION = "htc-full-current-v7-simple-location-search-2026-06-07"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
@@ -40,10 +40,12 @@ def log_request():
 
 def cache_get(key):
     item = CACHE.get(key)
+
     if not item:
         return None
 
     data, ts = item
+
     if time.time() - ts < CACHE_TTL:
         return data
 
@@ -224,10 +226,63 @@ def accu_timezone():
     }
 
 
+def simple_location_object(lat, lon, localized_name, english_name, country="UA"):
+    lat_f = float(lat)
+    lon_f = float(lon)
+    key = make_location_key(lat_f, lon_f)
+
+    return {
+        "Version": 1,
+        "Key": key,
+        "Type": "City",
+        "Rank": 10,
+        "LocalizedName": localized_name,
+        "EnglishName": english_name,
+        "PrimaryPostalCode": "",
+
+        "Region": {
+            "ID": "EUR",
+            "LocalizedName": "Европа",
+            "EnglishName": "Europe"
+        },
+
+        "Country": {
+            "ID": country,
+            "LocalizedName": "Украина",
+            "EnglishName": "Ukraine"
+        },
+
+        "AdministrativeArea": {
+            "ID": "12",
+            "LocalizedName": "Днепропетровская область",
+            "EnglishName": "Dnipropetrovsk Oblast",
+            "Level": 1,
+            "LocalizedType": "Область",
+            "EnglishType": "Oblast",
+            "CountryID": country
+        },
+
+        "TimeZone": {
+            "Code": "EET",
+            "Name": "Europe/Kyiv",
+            "GmtOffset": 2,
+            "IsDaylightSaving": False,
+            "NextOffsetChange": None
+        },
+
+        "GeoPosition": {
+            "Latitude": lat_f,
+            "Longitude": lon_f
+        },
+
+        "IsAlias": False,
+        "SupplementalAdminAreas": []
+    }
+
+
 def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
     lat_f = float(lat)
     lon_f = float(lon)
-
     key = make_location_key(lat_f, lon_f)
 
     return {
@@ -260,31 +315,10 @@ def accuweather_location_object(lat, lon, name="Unknown", country="UA"):
         "TimeZone": accu_timezone(),
         "GeoPosition": {
             "Latitude": lat_f,
-            "Longitude": lon_f,
-            "Elevation": {
-                "Metric": {
-                    "Value": 0.0,
-                    "Unit": "m",
-                    "UnitType": 5
-                },
-                "Imperial": {
-                    "Value": 0.0,
-                    "Unit": "ft",
-                    "UnitType": 0
-                }
-            }
+            "Longitude": lon_f
         },
         "IsAlias": False,
-        "SupplementalAdminAreas": [],
-        "DataSets": [
-            "AirQualityCurrentConditions",
-            "Alerts",
-            "DailyAirQualityForecast",
-            "DailyPollenForecast",
-            "ForecastConfidence",
-            "FutureRadar",
-            "MinuteCast"
-        ]
+        "SupplementalAdminAreas": []
     }
 
 
@@ -310,13 +344,39 @@ def get_location_by_coords(lat, lon):
         country = data.get("sys", {}).get("country") or "UA"
         result = accuweather_location_object(lat, lon, name, country)
     else:
-        result = accuweather_location_object(lat, lon, "Широке", "UA")
+        result = accuweather_location_object(lat, lon, "Широкое", "UA")
 
     cache_set(cache_key, result)
     return result
 
 
 def search_locations_by_text(query):
+    q = str(query or "").strip().lower()
+
+    # Жёстко отдаём один правильный Широкое, чтобы HTC не путался в дублях
+    if q in ["shyroke", "широке", "широкое", "shiroke"]:
+        return [
+            simple_location_object(
+                "47.6846511",
+                "33.2645369",
+                "Широкое",
+                "Shyroke",
+                "UA"
+            )
+        ]
+
+    # Киев для теста
+    if q in ["kyiv", "kiev", "киев", "київ"]:
+        return [
+            simple_location_object(
+                "50.4501",
+                "30.5234",
+                "Киев",
+                "Kyiv",
+                "UA"
+            )
+        ]
+
     cache_key = f"search:{query}"
     cached = cache_get(cache_key)
 
@@ -325,7 +385,7 @@ def search_locations_by_text(query):
 
     params = {
         "q": query,
-        "limit": 8,
+        "limit": 1,
         "appid": OPENWEATHER_API_KEY
     }
 
@@ -333,22 +393,39 @@ def search_locations_by_text(query):
     result = []
 
     if isinstance(data, list) and data:
-        for item in data:
-            lat = str(item.get("lat", "47.6847"))
-            lon = str(item.get("lon", "33.2645"))
+        item = data[0]
 
-            name = (
-                item.get("local_names", {}).get("ru")
-                or item.get("local_names", {}).get("uk")
-                or item.get("name")
-                or query
+        lat = str(item.get("lat", "47.6846511"))
+        lon = str(item.get("lon", "33.2645369"))
+
+        name = (
+            item.get("local_names", {}).get("ru")
+            or item.get("local_names", {}).get("uk")
+            or item.get("name")
+            or query
+        )
+
+        english_name = item.get("name") or query
+        country = item.get("country") or "UA"
+
+        result.append(
+            simple_location_object(
+                lat,
+                lon,
+                name,
+                english_name,
+                country
             )
-
-            country = item.get("country") or "UA"
-            result.append(accuweather_location_object(lat, lon, name, country))
+        )
     else:
         result.append(
-            accuweather_location_object("47.6847", "33.2645", "Широке", "UA")
+            simple_location_object(
+                "47.6846511",
+                "33.2645369",
+                "Широкое",
+                "Shyroke",
+                "UA"
+            )
         )
 
     cache_set(cache_key, result)
@@ -1134,7 +1211,7 @@ def location_search():
         request.args.get("q")
         or request.args.get("query")
         or request.args.get("city")
-        or "Широке"
+        or "Широкое"
     )
 
     return jsonify(search_locations_by_text(q))
@@ -1184,7 +1261,7 @@ def city_find_asp():
         or request.args.get("q")
         or request.args.get("query")
         or request.args.get("city")
-        or "Широке"
+        or "Широкое"
     )
 
     results = search_locations_by_text(q)
@@ -1192,13 +1269,13 @@ def city_find_asp():
     if results:
         first = results[0]
     else:
-        first = accuweather_location_object("47.6847", "33.2645", "Широке", "UA")
+        first = simple_location_object("47.6846511", "33.2645369", "Широкое", "Shyroke", "UA")
 
-    name = first.get("LocalizedName", "Широке")
+    name = first.get("LocalizedName", "Широкое")
     country = first.get("Country", {}).get("ID", "UA")
     geo = first.get("GeoPosition", {})
-    lat = geo.get("Latitude", 47.6847)
-    lon = geo.get("Longitude", 33.2645)
+    lat = geo.get("Latitude", 47.6846511)
+    lon = geo.get("Longitude", 33.2645369)
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <adc_database>
