@@ -12,12 +12,12 @@ from flask import Flask, request, jsonify, Response
 # ============================================================
 # HTC Weather / AccuWeather-like proxy -> OpenWeatherMap
 # File: weather_proxy.py
-# Version: htc-weather-proxy-v10-htc-parser-safe
+# Version: htc-weather-proxy-v11-numeric-city-key-geolocation
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "htc-weather-proxy-v10-htc-parser-safe"
+VERSION = "htc-weather-proxy-v11-numeric-city-key-geolocation"
 
 OPENWEATHER_API_KEY = (
     os.environ.get("OPENWEATHER_API_KEY")
@@ -28,6 +28,14 @@ OPENWEATHER_API_KEY = (
 
 DEFAULT_LANG = "ru"
 DEFAULT_COUNTRY = "UA"
+
+# ВАЖНО:
+# HTC Weather старых версий лучше работает с числовым city/location key.
+# Поэтому для Широкого используем стабильный числовой ключ.
+SHYROKE_KEY = "324178"
+OLD_SHYROKE_KEY = "KP0476847E0332645"
+SHYROKE_LAT = 47.6846511
+SHYROKE_LON = 33.2645369
 
 OWM_BASE = "https://api.openweathermap.org"
 TIMEOUT = 12
@@ -40,6 +48,8 @@ try:
     KYIV_TZ = ZoneInfo("Europe/Kyiv")
     KYIV_TZ_FALLBACK = False
 except ZoneInfoNotFoundError:
+    # Для Windows/Render без tzdata.
+    # В июне Украина = EEST / GMT+3.
     KYIV_TZ = timezone(timedelta(hours=3), name="EEST")
     KYIV_TZ_FALLBACK = True
 
@@ -323,6 +333,7 @@ def precipitation_type(weather_id):
     if 600 <= wid < 700:
         return "Snow"
 
+    # Не отдаём null — старые HTC-парсеры это плохо переваривают.
     return ""
 
 
@@ -527,13 +538,14 @@ def build_location(
     english_name="Shyroke",
     country="UA",
     state="Dnipropetrovsk Oblast",
+    key_override=None,
 ):
-    key = make_key(lat, lon)
+    key = key_override or make_key(lat, lon)
     country_en, country_local = country_names(country)
 
     obj = {
         "Version": 1,
-        "Key": key,
+        "Key": str(key),
         "Type": "City",
         "Rank": 10,
         "LocalizedName": localized_name,
@@ -567,28 +579,40 @@ def build_location(
         ],
     }
 
-    LOCATION_CACHE[key] = obj
+    LOCATION_CACHE[str(key)] = obj
     return obj
 
 
 def default_shyroke_location():
     return build_location(
-        47.6846511,
-        33.2645369,
+        SHYROKE_LAT,
+        SHYROKE_LON,
         localized_name="Широкое",
         english_name="Shyroke",
         country="UA",
         state="Dnipropetrovsk Oblast",
+        key_override=SHYROKE_KEY,
     )
 
 
 def location_by_key(key):
+    key = str(key)
+
+    # Новый числовой ключ и старый KP-ключ ведём к одному городу.
+    if key == SHYROKE_KEY or key == OLD_SHYROKE_KEY:
+        return default_shyroke_location()
+
     if key in LOCATION_CACHE:
         return LOCATION_CACHE[key]
 
     parsed = parse_key(key)
     if parsed:
         lat, lon = parsed
+
+        # Если это координатный ключ рядом с Широким — возвращаем именно Широкое.
+        if abs(float(lat) - SHYROKE_LAT) < 0.2 and abs(float(lon) - SHYROKE_LON) < 0.2:
+            return default_shyroke_location()
+
         return build_location(
             lat,
             lon,
@@ -598,6 +622,8 @@ def location_by_key(key):
             state="Dnipropetrovsk Oblast",
         )
 
+    # Если прилетел неизвестный числовой ключ — не падаем.
+    # Для нашего виджета лучше вернуть рабочий fallback.
     return default_shyroke_location()
 
 
@@ -632,6 +658,7 @@ def search_locations(q):
     if not q:
         return [default_shyroke_location()]
 
+    # Ручной поиск Широкого всегда возвращает стабильный числовой Key.
     if q_lower in ("shyroke", "shiroke", "shyrokoe", "широкое", "широке"):
         return [default_shyroke_location()]
 
@@ -658,6 +685,14 @@ def search_locations(q):
         country = item.get("country") or DEFAULT_COUNTRY
         state = item.get("state") or ""
 
+        # Если OWM вернул место рядом с Широким — тоже отдаём числовой Key 324178.
+        try:
+            if abs(float(lat) - SHYROKE_LAT) < 0.2 and abs(float(lon) - SHYROKE_LON) < 0.2:
+                result.append(default_shyroke_location())
+                continue
+        except Exception:
+            pass
+
         result.append(
             build_location(
                 lat,
@@ -676,6 +711,13 @@ def search_locations(q):
 
 
 def reverse_location(lat, lon):
+    # Автоопределение: если координаты рядом с Широким — возвращаем Широкое/324178.
+    try:
+        if abs(float(lat) - SHYROKE_LAT) < 0.2 and abs(float(lon) - SHYROKE_LON) < 0.2:
+            return default_shyroke_location()
+    except Exception:
+        pass
+
     try:
         data = owm_get(
             "/geo/1.0/reverse",
@@ -1442,6 +1484,8 @@ def status():
             "openweather_key_present": bool(OPENWEATHER_API_KEY),
             "timezone": kyiv_timezone_block(),
             "now": iso_kyiv(),
+            "shyroke_key": SHYROKE_KEY,
+            "old_shyroke_key": OLD_SHYROKE_KEY,
             "routes": [
                 "/locations/v1/search",
                 "/locations/v1/cities/geoposition/search",
