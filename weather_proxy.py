@@ -12,12 +12,12 @@ from flask import Flask, request, jsonify, Response
 # ============================================================
 # HTC Weather / AccuWeather-like proxy -> OpenWeatherMap
 # File: weather_proxy.py
-# Version: htc-weather-proxy-v9-kyiv-eest-geolocation
+# Version: htc-weather-proxy-v10-htc-parser-safe
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "htc-weather-proxy-v9-kyiv-eest-geolocation"
+VERSION = "htc-weather-proxy-v10-htc-parser-safe"
 
 OPENWEATHER_API_KEY = (
     os.environ.get("OPENWEATHER_API_KEY")
@@ -28,6 +28,7 @@ OPENWEATHER_API_KEY = (
 
 DEFAULT_LANG = "ru"
 DEFAULT_COUNTRY = "UA"
+
 OWM_BASE = "https://api.openweathermap.org"
 TIMEOUT = 12
 CACHE_TTL = 300
@@ -39,7 +40,6 @@ try:
     KYIV_TZ = ZoneInfo("Europe/Kyiv")
     KYIV_TZ_FALLBACK = False
 except ZoneInfoNotFoundError:
-    # Для Windows без tzdata. В июне нужен EEST/GMT+3.
     KYIV_TZ = timezone(timedelta(hours=3), name="EEST")
     KYIV_TZ_FALLBACK = True
 
@@ -73,17 +73,16 @@ def epoch(dt=None):
 
 
 def kyiv_timezone_block():
-    n = now_kyiv()
-
     if KYIV_TZ_FALLBACK:
         return {
             "Code": "EEST",
             "GmtOffset": 3,
             "IsDaylightSaving": True,
             "Name": "Europe/Kyiv",
-            "NextOffsetChange": None,
+            "NextOffsetChange": "",
         }
 
+    n = now_kyiv()
     offset = n.utcoffset() or timedelta(hours=2)
     dst = n.dst() or timedelta(0)
     offset_hours = int(offset.total_seconds() // 3600)
@@ -94,7 +93,7 @@ def kyiv_timezone_block():
         "GmtOffset": offset_hours,
         "IsDaylightSaving": bool(is_dst),
         "Name": "Europe/Kyiv",
-        "NextOffsetChange": None,
+        "NextOffsetChange": "",
     }
 
 
@@ -170,6 +169,10 @@ def pct(value):
         return 0
 
 
+# ============================================================
+# AccuWeather-like value blocks
+# ============================================================
+
 def metric_temp(c):
     return {
         "Value": num(c, 1),
@@ -179,7 +182,7 @@ def metric_temp(c):
 
 
 def imperial_temp(c):
-    f = float(c) * 9 / 5 + 32
+    f = float(num(c, 1)) * 9 / 5 + 32
     return {
         "Value": num(f, 1),
         "Unit": "F",
@@ -191,6 +194,14 @@ def temp_block(c):
     return {
         "Metric": metric_temp(c),
         "Imperial": imperial_temp(c),
+    }
+
+
+def daily_temp_value(c):
+    return {
+        "Value": num(c, 1),
+        "Unit": "C",
+        "UnitType": 17,
     }
 
 
@@ -282,6 +293,21 @@ def deg_to_compass(deg):
     return dirs[int((deg + 11.25) / 22.5) % 16]
 
 
+def wind_direction_block(deg):
+    return {
+        "Degrees": int(num(deg, 0)),
+        "Localized": deg_to_compass(deg),
+        "English": deg_to_compass(deg),
+    }
+
+
+def wind_block(wind_kmh, wind_deg):
+    return {
+        "Speed": speed_block_kmh(wind_kmh),
+        "Direction": wind_direction_block(wind_deg),
+    }
+
+
 def is_daytime_by_icon(icon):
     return str(icon or "").endswith("d")
 
@@ -297,7 +323,7 @@ def precipitation_type(weather_id):
     if 600 <= wid < 700:
         return "Snow"
 
-    return None
+    return ""
 
 
 def has_precipitation(weather_id, pop=0, rain_mm=0, snow_mm=0):
@@ -388,6 +414,48 @@ def accuweather_icon(weather_id=800, owm_icon=None, clouds=0, is_day=True):
         return 6 if is_day else 38
 
     return 7 if is_day else 38
+
+
+def air_and_pollen_block():
+    return [
+        {
+            "Name": "AirQuality",
+            "Value": 0,
+            "Category": "Good",
+            "CategoryValue": 1,
+            "Type": "Ozone",
+        },
+        {
+            "Name": "Grass",
+            "Value": 0,
+            "Category": "Low",
+            "CategoryValue": 1,
+        },
+        {
+            "Name": "Mold",
+            "Value": 0,
+            "Category": "Low",
+            "CategoryValue": 1,
+        },
+        {
+            "Name": "Ragweed",
+            "Value": 0,
+            "Category": "Low",
+            "CategoryValue": 1,
+        },
+        {
+            "Name": "Tree",
+            "Value": 0,
+            "Category": "Low",
+            "CategoryValue": 1,
+        },
+        {
+            "Name": "UVIndex",
+            "Value": 0,
+            "Category": "Low",
+            "CategoryValue": 1,
+        },
+    ]
 
 
 # ============================================================
@@ -767,6 +835,7 @@ def current_conditions_response(key):
 
     text = weather_text(weather.get("description"), wid, is_day)
     icon = accuweather_icon(wid, owm_icon, cloud_cover, is_day)
+    ptype = precipitation_type(wid)
 
     return [
         {
@@ -775,7 +844,7 @@ def current_conditions_response(key):
             "WeatherText": text,
             "WeatherIcon": icon,
             "HasPrecipitation": has_precipitation(wid, rain_mm=rain_1h, snow_mm=snow_1h),
-            "PrecipitationType": precipitation_type(wid),
+            "PrecipitationType": ptype,
             "IsDayTime": bool(is_day),
 
             "Temperature": temp_block(temp),
@@ -799,11 +868,7 @@ def current_conditions_response(key):
             "IndoorRelativeHumidity": humidity,
 
             "Wind": {
-                "Direction": {
-                    "Degrees": wind_deg,
-                    "Localized": deg_to_compass(wind_deg),
-                    "English": deg_to_compass(wind_deg),
-                },
+                "Direction": wind_direction_block(wind_deg),
                 "Speed": speed_block_kmh(wind_kmh),
             },
             "WindGust": {
@@ -867,7 +932,7 @@ def fallback_current(error=None):
         "WeatherText": "пасмурно",
         "WeatherIcon": 7,
         "HasPrecipitation": False,
-        "PrecipitationType": None,
+        "PrecipitationType": "",
         "IsDayTime": True,
         "Temperature": temp_block(20),
         "RealFeelTemperature": {
@@ -880,11 +945,7 @@ def fallback_current(error=None):
         },
         "RelativeHumidity": 60,
         "Wind": {
-            "Direction": {
-                "Degrees": 0,
-                "Localized": "N",
-                "English": "N",
-            },
+            "Direction": wind_direction_block(0),
             "Speed": speed_block_kmh(0),
         },
         "Pressure": pressure_block_hpa(1013),
@@ -922,15 +983,16 @@ def make_daily_item(
 ):
     ptype = precipitation_type(weather_id)
     has_prec = has_precipitation(weather_id, pop, rain_mm, snow_mm)
-
     pop_percent = pct((pop or 0) * 100 if pop <= 1 else pop)
+
+    precip_intensity = "Light" if has_prec else ""
 
     day = {
         "Icon": int(day_icon),
         "IconPhrase": phrase,
-        "HasPrecipitation": has_prec,
+        "HasPrecipitation": bool(has_prec),
         "PrecipitationType": ptype,
-        "PrecipitationIntensity": "Light" if has_prec else None,
+        "PrecipitationIntensity": precip_intensity,
         "ShortPhrase": phrase,
         "LongPhrase": phrase,
         "PrecipitationProbability": pop_percent,
@@ -938,22 +1000,8 @@ def make_daily_item(
         "RainProbability": pop_percent if ptype == "Rain" else 0,
         "SnowProbability": pop_percent if ptype == "Snow" else 0,
         "IceProbability": 0,
-        "Wind": {
-            "Speed": speed_block_kmh(wind_kmh),
-            "Direction": {
-                "Degrees": int(wind_deg or 0),
-                "Localized": deg_to_compass(wind_deg),
-                "English": deg_to_compass(wind_deg),
-            },
-        },
-        "WindGust": {
-            "Speed": speed_block_kmh(wind_kmh),
-            "Direction": {
-                "Degrees": int(wind_deg or 0),
-                "Localized": deg_to_compass(wind_deg),
-                "English": deg_to_compass(wind_deg),
-            },
-        },
+        "Wind": wind_block(wind_kmh, wind_deg),
+        "WindGust": wind_block(wind_kmh, wind_deg),
         "TotalLiquid": mm_block(rain_mm + snow_mm),
         "Rain": mm_block(rain_mm),
         "Snow": mm_block(snow_mm),
@@ -965,8 +1013,10 @@ def make_daily_item(
         "CloudCover": pct(clouds),
     }
 
-    night = dict(day)
-    night["Icon"] = int(night_icon)
+    night = {
+        **day,
+        "Icon": int(night_icon),
+    }
 
     return {
         "Date": iso_kyiv(dt),
@@ -986,23 +1036,23 @@ def make_daily_item(
             "Age": 5,
         },
         "Temperature": {
-            "Minimum": metric_temp(min_c),
-            "Maximum": metric_temp(max_c),
+            "Minimum": daily_temp_value(min_c),
+            "Maximum": daily_temp_value(max_c),
         },
         "RealFeelTemperature": {
-            "Minimum": metric_temp(min_c),
-            "Maximum": metric_temp(max_c),
+            "Minimum": daily_temp_value(min_c),
+            "Maximum": daily_temp_value(max_c),
         },
         "RealFeelTemperatureShade": {
-            "Minimum": metric_temp(min_c),
-            "Maximum": metric_temp(max_c),
+            "Minimum": daily_temp_value(min_c),
+            "Maximum": daily_temp_value(max_c),
         },
         "HoursOfSun": 8.0,
         "DegreeDaySummary": {
-            "Heating": metric_temp(0),
-            "Cooling": metric_temp(0),
+            "Heating": daily_temp_value(0),
+            "Cooling": daily_temp_value(0),
         },
-        "AirAndPollen": [],
+        "AirAndPollen": air_and_pollen_block(),
         "Day": day,
         "Night": night,
         "Sources": ["OpenWeatherMap"],
@@ -1228,9 +1278,9 @@ def make_hourly_item(
         "EpochDateTime": epoch(dt),
         "WeatherIcon": icon,
         "IconPhrase": phrase,
-        "HasPrecipitation": has_prec,
+        "HasPrecipitation": bool(has_prec),
         "PrecipitationType": ptype,
-        "PrecipitationIntensity": "Light" if has_prec else None,
+        "PrecipitationIntensity": "Light" if has_prec else "",
         "IsDaylight": bool(is_day),
         "Temperature": metric_temp(temp),
         "RealFeelTemperature": metric_temp(feels),
@@ -1238,11 +1288,7 @@ def make_hourly_item(
         "DewPoint": metric_temp(num(temp, 1) - 2),
         "Wind": {
             "Speed": speed_block_kmh(wind_kmh),
-            "Direction": {
-                "Degrees": int(wind_deg or 0),
-                "Localized": deg_to_compass(wind_deg),
-                "English": deg_to_compass(wind_deg),
-            },
+            "Direction": wind_direction_block(wind_deg),
         },
         "WindGust": {
             "Speed": speed_block_kmh(wind_kmh),
