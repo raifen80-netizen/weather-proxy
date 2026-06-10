@@ -1,258 +1,185 @@
-# weather_proxy.py
-# HTC Weather / WeatherClock proxy for Android 15
-# Version: htc-weather-proxy-v13-force-hourly-daytime
-#
-# Render Start Command:
-#   gunicorn weather_proxy:app
-#
-# requirements.txt:
-#   flask
-#   requests
-#   tzdata
-#   gunicorn
-#
-# Render Environment:
-#   OPENWEATHER_API_KEY = your OpenWeatherMap API key
-
-from __future__ import annotations
-
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
-app.json.ensure_ascii = False
 
-VERSION = "htc-weather-proxy-v13-force-hourly-daytime"
+VERSION = "htc-weather-proxy-v14-openmeteo-daily-separate-night"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 OWM_BASE = "https://api.openweathermap.org"
+OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 
-DEFAULT_LANGUAGE = "ru"
-DEFAULT_TZ_NAME = "Europe/Kyiv"
-KYIV_TZ = ZoneInfo(DEFAULT_TZ_NAME)
+KYIV_TZ_NAME = "Europe/Kyiv"
+KYIV_TZ = ZoneInfo(KYIV_TZ_NAME)
 
-SHYROKE_KEY = "324178"
-OLD_SHYROKE_KEY = "KP0476847E0332645"
-SHYROKE_LAT = 47.6846511
-SHYROKE_LON = 33.2645369
-SHYROKE_NAME_RU = "Широке"
-SHYROKE_NAME_EN = "Shyroke"
-SHYROKE_ADMIN = "Днепропетровская область"
-SHYROKE_COUNTRY = "UA"
+SHYROKE = {
+    "key": "324178",
+    "old_key": "KP0476847E0332645",
+    "name_ru": "Широке",
+    "name_en": "Shyroke",
+    "country_id": "UA",
+    "country_ru": "Украина",
+    "country_en": "Ukraine",
+    "admin_ru": "Днепропетровская область",
+    "admin_en": "Днепропетровская область",
+    "lat": 47.6846511,
+    "lon": 33.2645369,
+}
 
-_CACHE: Dict[str, Tuple[float, Any]] = {}
-CACHE_SECONDS = 600
 
-
-def now_kyiv() -> datetime:
+def kyiv_now() -> datetime:
     return datetime.now(KYIV_TZ)
 
 
-def local_iso(dt: datetime) -> str:
+def iso_kyiv(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KYIV_TZ)
     return dt.astimezone(KYIV_TZ).isoformat(timespec="seconds")
 
 
 def epoch(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KYIV_TZ)
     return int(dt.timestamp())
 
 
-def get_language() -> str:
-    lang = request.args.get("language") or request.args.get("lang") or DEFAULT_LANGUAGE
-    lang = lang.lower().split("-")[0]
-    if lang not in {"ru", "uk", "en"}:
-        lang = DEFAULT_LANGUAGE
-    return lang
-
-
-def cache_get(key: str) -> Optional[Any]:
-    hit = _CACHE.get(key)
-    if not hit:
-        return None
-
-    ts, data = hit
-    if time.time() - ts > CACHE_SECONDS:
-        _CACHE.pop(key, None)
-        return None
-
-    return data
-
-
-def cache_set(key: str, data: Any) -> Any:
-    _CACHE[key] = (time.time(), data)
-    return data
-
-
-def require_api_key() -> Optional[Response]:
-    if not OPENWEATHER_API_KEY:
-        return jsonify({
-            "error": "OPENWEATHER_API_KEY is not set",
-            "version": VERSION,
-        }), 500
-    return None
-
-
-def owm_get(path: str, params: Dict[str, Any], cache_key: str) -> Any:
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    if not OPENWEATHER_API_KEY:
-        raise RuntimeError("OPENWEATHER_API_KEY is not set")
-
-    final_params = dict(params)
-    final_params["appid"] = OPENWEATHER_API_KEY
-
-    url = f"{OWM_BASE}{path}"
-    r = requests.get(url, params=final_params, timeout=15)
-    r.raise_for_status()
-
-    return cache_set(cache_key, r.json())
-
-
-def round1(value: Any, default: float = 0.0) -> float:
+def safe_float(value, default=0.0) -> float:
     try:
-        return round(float(value), 1)
+        if value is None:
+            return default
+        return float(value)
     except Exception:
         return default
 
 
-def round0(value: Any, default: int = 0) -> int:
+def safe_int(value, default=0) -> int:
     try:
+        if value is None:
+            return default
         return int(round(float(value)))
     except Exception:
         return default
 
 
 def c_to_f(c: float) -> float:
-    return round((c * 9 / 5) + 32, 1)
+    return round((c * 9.0 / 5.0) + 32.0, 1)
 
 
-def ms_to_kmh(ms: Any) -> float:
-    try:
-        return round(float(ms) * 3.6, 1)
-    except Exception:
-        return 0.0
+def kmh_to_mph(kmh: float) -> float:
+    return round(kmh * 0.621371, 1)
 
 
-def deg_to_dir(deg: Any) -> str:
-    try:
-        d = float(deg) % 360
-    except Exception:
-        return "N"
+def mb_to_inhg(mb: float) -> float:
+    return round(mb * 0.0295299830714, 1)
 
+
+def metric_temp(c: float) -> dict:
+    c = round(safe_float(c), 1)
+    return {
+        "Metric": {"Value": c, "Unit": "C", "UnitType": 17},
+        "Imperial": {"Value": c_to_f(c), "Unit": "F", "UnitType": 18},
+    }
+
+
+def daily_temp(c: float) -> dict:
+    return {"Value": round(safe_float(c), 1), "Unit": "C", "UnitType": 17}
+
+
+def metric_length_mm(mm: float) -> dict:
+    mm = round(safe_float(mm), 1)
+    return {
+        "Metric": {"Value": mm, "Unit": "mm", "UnitType": 3},
+        "Imperial": {"Value": round(mm / 25.4, 2), "Unit": "in", "UnitType": 1},
+    }
+
+
+def daily_rain_mm(mm: float) -> dict:
+    return {"Value": round(safe_float(mm), 1), "Unit": "mm", "UnitType": 3}
+
+
+def daily_snow_cm(cm: float) -> dict:
+    return {"Value": round(safe_float(cm), 1), "Unit": "cm", "UnitType": 4}
+
+
+def metric_speed_kmh(kmh: float) -> dict:
+    kmh = round(safe_float(kmh), 1)
+    return {
+        "Metric": {"Value": kmh, "Unit": "km/h", "UnitType": 7},
+        "Imperial": {"Value": kmh_to_mph(kmh), "Unit": "mi/h", "UnitType": 9},
+    }
+
+
+def direction_from_degrees(deg: float) -> dict:
+    deg = safe_int(deg, 0) % 360
     dirs = [
         "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
     ]
-    return dirs[int((d + 11.25) / 22.5) % 16]
+    idx = int((deg + 11.25) // 22.5) % 16
+    name = dirs[idx]
+    return {"Degrees": deg, "English": name, "Localized": name}
 
 
-def metric_value(value: Any, unit: str, unit_type: int) -> Dict[str, Any]:
-    return {
-        "Value": value,
-        "Unit": unit,
-        "UnitType": unit_type,
-    }
-
-
-def temp_block_c(c: Any) -> Dict[str, Any]:
-    c = round1(c)
-    return {
-        "Metric": metric_value(c, "C", 17),
-        "Imperial": metric_value(c_to_f(c), "F", 18),
-    }
-
-
-def timezone_block() -> Dict[str, Any]:
+def timezone_payload() -> dict:
     return {
         "Code": "EEST",
+        "Name": KYIV_TZ_NAME,
         "GmtOffset": 3,
         "IsDaylightSaving": True,
-        "Name": DEFAULT_TZ_NAME,
         "NextOffsetChange": "",
     }
 
 
-def parse_location_key(location_key: str) -> Tuple[float, float, str, str, str, str]:
-    key = str(location_key or "").strip()
+def location_payload(
+    key: str = None,
+    name_ru: str = None,
+    name_en: str = None,
+    lat: float = None,
+    lon: float = None,
+    country_id: str = "UA",
+    country_ru: str = "Украина",
+    country_en: str = "Ukraine",
+    admin_ru: str = "Днепропетровская область",
+    admin_en: str = "Днепропетровская область",
+) -> dict:
+    key = key or SHYROKE["key"]
+    name_ru = name_ru or SHYROKE["name_ru"]
+    name_en = name_en or SHYROKE["name_en"]
+    lat = SHYROKE["lat"] if lat is None else safe_float(lat)
+    lon = SHYROKE["lon"] if lon is None else safe_float(lon)
 
-    if key in {"", "0", SHYROKE_KEY, OLD_SHYROKE_KEY, "shyroke", "Shyroke"}:
-        return (
-            SHYROKE_LAT,
-            SHYROKE_LON,
-            SHYROKE_KEY,
-            SHYROKE_NAME_RU,
-            SHYROKE_ADMIN,
-            SHYROKE_COUNTRY,
-        )
-
-    if "," in key:
-        try:
-            lat_s, lon_s = key.split(",", 1)
-            lat = float(lat_s.strip())
-            lon = float(lon_s.strip())
-            return (lat, lon, key, "Current location", "", "")
-        except Exception:
-            pass
-
-    return (
-        SHYROKE_LAT,
-        SHYROKE_LON,
-        SHYROKE_KEY,
-        SHYROKE_NAME_RU,
-        SHYROKE_ADMIN,
-        SHYROKE_COUNTRY,
-    )
-
-
-def location_object(
-    key: str = SHYROKE_KEY,
-    name: str = SHYROKE_NAME_RU,
-    lat: float = SHYROKE_LAT,
-    lon: float = SHYROKE_LON,
-    admin: str = SHYROKE_ADMIN,
-    country: str = SHYROKE_COUNTRY,
-) -> Dict[str, Any]:
     return {
         "Version": 1,
         "Key": str(key),
         "Type": "City",
         "Rank": 35,
-        "LocalizedName": name,
-        "EnglishName": SHYROKE_NAME_EN if str(key) == SHYROKE_KEY else name,
+        "LocalizedName": name_ru,
+        "EnglishName": name_en,
         "PrimaryPostalCode": "",
-        "Region": {
-            "ID": "EUR",
-            "LocalizedName": "Европа",
-            "EnglishName": "Europe",
-        },
-        "Country": {
-            "ID": country or "UA",
-            "LocalizedName": "Украина" if (country or "UA") == "UA" else country,
-            "EnglishName": "Ukraine" if (country or "UA") == "UA" else country,
-        },
+        "Region": {"ID": "EUR", "LocalizedName": "Европа", "EnglishName": "Europe"},
+        "Country": {"ID": country_id, "LocalizedName": country_ru, "EnglishName": country_en},
         "AdministrativeArea": {
             "ID": "",
-            "LocalizedName": admin or "",
-            "EnglishName": admin or "",
+            "LocalizedName": admin_ru,
+            "EnglishName": admin_en,
             "Level": 1,
             "LocalizedType": "область",
             "EnglishType": "Oblast",
-            "CountryID": country or "UA",
+            "CountryID": country_id,
         },
-        "TimeZone": timezone_block(),
+        "TimeZone": timezone_payload(),
         "GeoPosition": {
             "Latitude": lat,
             "Longitude": lon,
             "Elevation": {
-                "Metric": metric_value(0, "m", 5),
-                "Imperial": metric_value(0, "ft", 0),
+                "Metric": {"Value": 0, "Unit": "m", "UnitType": 5},
+                "Imperial": {"Value": 0, "Unit": "ft", "UnitType": 0},
             },
         },
         "IsAlias": False,
@@ -269,866 +196,694 @@ def location_object(
     }
 
 
-def search_locations(q: str, lang: str) -> List[Dict[str, Any]]:
-    q_clean = (q or "").strip().lower()
+def is_shyroke_query(q: str) -> bool:
+    q = (q or "").strip().lower()
+    return any(x in q for x in ["shyroke", "широке", "shiroke", "шыроке"])
 
-    if not q_clean:
-        return [location_object()]
 
-    if any(x in q_clean for x in ["shyroke", "shiroke", "широке", "широкое"]):
-        return [location_object()]
+def parse_geoposition() -> tuple[float, float]:
+    q = request.args.get("q") or request.args.get("geoposition") or request.args.get("geoPosition")
+    if q and "," in q:
+        a, b = q.split(",", 1)
+        return safe_float(a, SHYROKE["lat"]), safe_float(b, SHYROKE["lon"])
 
+    lat = request.args.get("lat") or request.args.get("latitude") or request.args.get("Latitude")
+    lon = request.args.get("lon") or request.args.get("lng") or request.args.get("longitude") or request.args.get("Longitude")
+    return safe_float(lat, SHYROKE["lat"]), safe_float(lon, SHYROKE["lon"])
+
+
+def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def resolve_location_key(key: str) -> dict:
+    key = str(key or "").strip()
+    if key in ["", SHYROKE["key"], SHYROKE["old_key"], "KP0476847E0332645"]:
+        return {
+            "key": SHYROKE["key"],
+            "lat": SHYROKE["lat"],
+            "lon": SHYROKE["lon"],
+            "name_ru": SHYROKE["name_ru"],
+            "name_en": SHYROKE["name_en"],
+        }
+
+    # Неизвестный ключ не валим, чтобы HTC не падал.
+    return {
+        "key": key,
+        "lat": SHYROKE["lat"],
+        "lon": SHYROKE["lon"],
+        "name_ru": SHYROKE["name_ru"],
+        "name_en": SHYROKE["name_en"],
+    }
+
+
+def http_get_json(url: str, params: dict, timeout: int = 15) -> dict:
+    r = requests.get(url, params=params, timeout=timeout)
     try:
-        data = owm_get(
-            "/geo/1.0/direct",
-            {"q": q, "limit": 5},
-            f"geo_direct:{lang}:{q}",
-        )
-
-        out: List[Dict[str, Any]] = []
-        for idx, item in enumerate(data or []):
-            lat = float(item.get("lat"))
-            lon = float(item.get("lon"))
-            name = item.get("local_names", {}).get(lang) or item.get("name") or q
-            admin = item.get("state") or ""
-            country = item.get("country") or ""
-            key = f"OWM{idx}_{round(lat, 5)}_{round(lon, 5)}".replace(".", "p").replace("-", "m")
-            out.append(location_object(key, name, lat, lon, admin, country))
-
-        return out or [location_object()]
+        data = r.json()
     except Exception:
-        return [location_object()]
+        data = {"raw": r.text[:500]}
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {data}")
+    return data
 
 
-def reverse_geoposition(q: str, lang: str) -> Dict[str, Any]:
-    try:
-        lat_s, lon_s = q.split(",", 1)
-        lat = float(lat_s.strip())
-        lon = float(lon_s.strip())
-    except Exception:
-        lat, lon = SHYROKE_LAT, SHYROKE_LON
-
-    if abs(lat - SHYROKE_LAT) < 0.35 and abs(lon - SHYROKE_LON) < 0.35:
-        return location_object()
-
-    try:
-        data = owm_get(
-            "/geo/1.0/reverse",
-            {"lat": lat, "lon": lon, "limit": 1},
-            f"geo_reverse:{lang}:{lat:.5f},{lon:.5f}",
-        )
-
-        if data:
-            item = data[0]
-            name = item.get("local_names", {}).get(lang) or item.get("name") or "Current location"
-            admin = item.get("state") or ""
-            country = item.get("country") or ""
-            key = f"OWM_{round(lat, 5)}_{round(lon, 5)}".replace(".", "p").replace("-", "m")
-            return location_object(key, name, lat, lon, admin, country)
-    except Exception:
-        pass
-
-    return location_object(SHYROKE_KEY, SHYROKE_NAME_RU, lat, lon, SHYROKE_ADMIN, SHYROKE_COUNTRY)
+def proxy_error(message: str, status_code: int = 500):
+    return jsonify({"ok": False, "ProxyError": str(message), "version": VERSION}), status_code
 
 
-def owm_phrase(weather: Dict[str, Any], lang: str) -> str:
-    desc = (weather or {}).get("description") or (weather or {}).get("main") or ""
-    desc = str(desc).strip()
-    if desc:
-        return desc
-    return "Переменная облачность" if lang == "ru" else "Partly cloudy"
+def require_openweather_key():
+    if not OPENWEATHER_API_KEY:
+        raise RuntimeError("OPENWEATHER_API_KEY is empty on Render")
 
 
-def accu_icon_from_owm(weather_id: int, clouds: int, is_day: bool) -> int:
-    wid = int(weather_id or 800)
-    c = int(clouds or 0)
+def openmeteo_icon_phrase(code: int, night: bool = False) -> tuple[int, str]:
+    code = safe_int(code, 3)
+    if code == 0:
+        return (33, "ясно") if night else (1, "солнечно")
+    if code == 1:
+        return (34, "преимущественно ясно") if night else (2, "небольшая облачность")
+    if code == 2:
+        return (35, "переменная облачность") if night else (3, "переменная облачность")
+    if code == 3:
+        return (38, "пасмурно") if night else (7, "пасмурно")
+    if code in (45, 48):
+        return 11, "туман"
+    if code in (51, 53, 55, 56, 57):
+        return (39, "морось") if night else (12, "морось")
+    if code in (61, 63, 65, 80, 81, 82):
+        return (40, "дождь") if night else (18, "дождь")
+    if code in (66, 67):
+        return (42, "ледяной дождь") if night else (24, "ледяной дождь")
+    if code in (71, 73, 75, 77, 85, 86):
+        return (44, "снег") if night else (22, "снег")
+    if code == 95:
+        return (41, "гроза") if night else (15, "гроза")
+    if code in (96, 99):
+        return (42, "сильная гроза") if night else (17, "сильная гроза")
+    return (35, "переменная облачность") if night else (3, "переменная облачность")
 
-    if 200 <= wid <= 232:
-        return 15 if is_day else 41
 
-    if 300 <= wid <= 321:
-        return 12 if is_day else 39
+def cloud_cover_from_code(code: int) -> int:
+    code = safe_int(code, 3)
+    if code == 0:
+        return 0
+    if code == 1:
+        return 20
+    if code == 2:
+        return 50
+    if code == 3:
+        return 100
+    if code in (45, 48):
+        return 90
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99):
+        return 85
+    return 50
 
-    if 500 <= wid <= 504:
-        return 18
 
-    if wid == 511:
-        return 26
+def has_precip_from_code(code: int, precip_mm: float) -> bool:
+    if safe_float(precip_mm) > 0.01:
+        return True
+    return safe_int(code) in {
+        51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+        71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99,
+    }
 
-    if 520 <= wid <= 531:
-        return 12 if is_day else 39
 
-    if 600 <= wid <= 622:
-        return 22
+def precip_type_from_code(code: int) -> str:
+    code = safe_int(code)
+    if code in (71, 73, 75, 77, 85, 86):
+        return "Snow"
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99):
+        return "Rain"
+    return ""
 
-    if 701 <= wid <= 781:
-        return 11
 
+def owm_icon_phrase(weather_id: int, icon: str = "", force_daytime: bool = True) -> tuple[int, str]:
+    wid = safe_int(weather_id, 800)
+    is_night = (not force_daytime) and str(icon).endswith("n")
+    if 200 <= wid < 300:
+        return (41, "гроза") if is_night else (15, "гроза")
+    if 300 <= wid < 400:
+        return (39, "морось") if is_night else (12, "морось")
+    if 500 <= wid < 600:
+        return (40, "дождь") if is_night else (18, "дождь")
+    if 600 <= wid < 700:
+        return (44, "снег") if is_night else (22, "снег")
+    if 700 <= wid < 800:
+        return 11, "туман"
     if wid == 800:
-        return 1 if is_day else 33
-
-    if 801 <= wid <= 804:
-        if c <= 25:
-            return 2 if is_day else 34
-        if c <= 50:
-            return 3 if is_day else 35
-        if c <= 75:
-            return 6 if is_day else 38
-        return 7 if is_day else 38
-
-    return 3 if is_day else 35
+        return (33, "ясно") if is_night else (1, "солнечно")
+    if wid == 801:
+        return (34, "небольшая облачность") if is_night else (2, "небольшая облачность")
+    if wid == 802:
+        return (35, "переменная облачность") if is_night else (3, "переменная облачность")
+    if wid == 803:
+        return (36, "облачно с прояснениями") if is_night else (4, "облачно с прояснениями")
+    if wid == 804:
+        return (38, "пасмурно") if is_night else (7, "пасмурно")
+    return (35, "переменная облачность") if is_night else (3, "переменная облачность")
 
 
-def precipitation_from_owm(weather_id: int) -> Tuple[bool, str, str]:
-    wid = int(weather_id or 800)
-
-    if 200 <= wid <= 232:
-        return True, "Rain", "Heavy"
-
-    if 300 <= wid <= 321:
-        return True, "Rain", "Light"
-
-    if 500 <= wid <= 504:
-        return True, "Rain", "Moderate"
-
-    if wid == 511:
-        return True, "Ice", "Moderate"
-
-    if 520 <= wid <= 531:
-        return True, "Rain", "Moderate"
-
-    if 600 <= wid <= 622:
-        return True, "Snow", "Moderate"
-
-    return False, "", ""
-
-
-def make_daynight_block(item: Dict[str, Any], lang: str, force_day: bool) -> Dict[str, Any]:
-    weather = (item.get("weather") or [{}])[0]
-    weather_id = int(weather.get("id", 800))
-    clouds = int((item.get("clouds") or {}).get("all", 0))
-    phrase = owm_phrase(weather, lang)
-    icon = accu_icon_from_owm(weather_id, clouds, force_day)
-    has_precip, precip_type, precip_intensity = precipitation_from_owm(weather_id)
-
-    wind = item.get("wind") or {}
-    wind_ms = wind.get("speed", 0)
-    wind_deg = wind.get("deg", 0)
-    pop = round0(float(item.get("pop", 0)) * 100, 0)
-
-    rain_mm = 0.0
-    snow_mm = 0.0
-
-    if isinstance(item.get("rain"), dict):
-        rain_mm = round1(item["rain"].get("3h", 0.0))
-
-    if isinstance(item.get("snow"), dict):
-        snow_mm = round1(item["snow"].get("3h", 0.0))
+def make_day_night_block(code, night, precip_prob, precip_mm, rain_mm, snow_cm, wind_kmh, wind_deg, gust_kmh):
+    icon, phrase = openmeteo_icon_phrase(code, night=night)
+    has_precip = has_precip_from_code(code, precip_mm)
+    precip_type = precip_type_from_code(code)
+    rain_prob = precip_prob if precip_type == "Rain" else 0
+    snow_prob = precip_prob if precip_type == "Snow" else 0
+    thunder_prob = precip_prob if safe_int(code) in (95, 96, 99) else 0
 
     return {
         "Icon": icon,
         "IconPhrase": phrase,
-        "HasPrecipitation": has_precip,
-        "PrecipitationType": precip_type,
-        "PrecipitationIntensity": precip_intensity,
         "ShortPhrase": phrase,
         "LongPhrase": phrase,
-        "PrecipitationProbability": pop,
-        "ThunderstormProbability": pop if 200 <= weather_id <= 232 else 0,
-        "RainProbability": pop if precip_type == "Rain" else 0,
-        "SnowProbability": pop if precip_type == "Snow" else 0,
-        "IceProbability": pop if precip_type == "Ice" else 0,
-        "Wind": {
-            "Direction": {
-                "Degrees": round0(wind_deg),
-                "Localized": deg_to_dir(wind_deg),
-                "English": deg_to_dir(wind_deg),
-            },
-            "Speed": {
-                "Metric": metric_value(ms_to_kmh(wind_ms), "km/h", 7),
-                "Imperial": metric_value(round1(ms_to_kmh(wind_ms) / 1.60934), "mi/h", 9),
-            },
-        },
-        "WindGust": {
-            "Speed": {
-                "Metric": metric_value(ms_to_kmh(wind.get("gust", wind_ms)), "km/h", 7),
-                "Imperial": metric_value(round1(ms_to_kmh(wind.get("gust", wind_ms)) / 1.60934), "mi/h", 9),
-            },
-        },
-        "Rain": {
-            "Value": rain_mm,
-            "Unit": "mm",
-            "UnitType": 3,
-        },
-        "Snow": {
-            "Value": snow_mm,
-            "Unit": "cm",
-            "UnitType": 4,
-        },
-        "Ice": {
-            "Value": 0.0,
-            "Unit": "mm",
-            "UnitType": 3,
-        },
+        "HasPrecipitation": has_precip,
+        "PrecipitationType": precip_type if has_precip else "",
+        "PrecipitationIntensity": "Light" if has_precip else "",
+        "PrecipitationProbability": safe_int(precip_prob),
+        "ThunderstormProbability": safe_int(thunder_prob),
+        "RainProbability": safe_int(rain_prob),
+        "SnowProbability": safe_int(snow_prob),
+        "IceProbability": 0,
+        "CloudCover": cloud_cover_from_code(code),
         "HoursOfPrecipitation": 1 if has_precip else 0,
-        "HoursOfRain": 1 if precip_type == "Rain" else 0,
-        "HoursOfSnow": 1 if precip_type == "Snow" else 0,
-        "HoursOfIce": 1 if precip_type == "Ice" else 0,
-        "CloudCover": clouds,
+        "HoursOfRain": 1 if rain_prob > 0 else 0,
+        "HoursOfSnow": 1 if snow_prob > 0 else 0,
+        "HoursOfIce": 0,
+        "Rain": daily_rain_mm(rain_mm),
+        "Snow": daily_snow_cm(snow_cm),
+        "Ice": daily_rain_mm(0),
+        "Wind": {
+            "Speed": metric_speed_kmh(wind_kmh),
+            "Direction": direction_from_degrees(wind_deg),
+        },
+        "WindGust": {"Speed": metric_speed_kmh(gust_kmh if gust_kmh else wind_kmh)},
     }
 
 
-def default_forecast_item(dt: datetime, temp_c: float = 22.0) -> Dict[str, Any]:
-    return {
-        "dt": epoch(dt),
-        "dt_txt": dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "main": {
-            "temp": temp_c,
-            "temp_min": temp_c - 2,
-            "temp_max": temp_c + 2,
-            "feels_like": temp_c,
-            "humidity": 60,
-            "pressure": 1012,
-        },
-        "weather": [{
-            "id": 801,
-            "main": "Clouds",
-            "description": "облачно с прояснениями",
-            "icon": "02d",
-        }],
-        "clouds": {
-            "all": 50,
-        },
-        "wind": {
-            "speed": 3.0,
-            "deg": 90,
-        },
-        "pop": 0.0,
+def fetch_openmeteo_daily(lat: float, lon: float, days: int) -> dict:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": KYIV_TZ_NAME,
+        "forecast_days": days,
+        "daily": ",".join([
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "apparent_temperature_max",
+            "apparent_temperature_min",
+            "sunrise",
+            "sunset",
+            "precipitation_sum",
+            "rain_sum",
+            "showers_sum",
+            "snowfall_sum",
+            "precipitation_probability_max",
+            "wind_speed_10m_max",
+            "wind_gusts_10m_max",
+            "wind_direction_10m_dominant",
+        ]),
     }
+    return http_get_json(OPEN_METEO_BASE, params=params)
 
 
-def air_and_pollen() -> List[Dict[str, Any]]:
-    names = ["AirQuality", "Grass", "Mold", "Ragweed", "Tree", "UVIndex"]
+def build_daily_forecast(key: str, days: int):
+    loc = resolve_location_key(key)
+    data = fetch_openmeteo_daily(loc["lat"], loc["lon"], days)
+    daily = data.get("daily") or {}
+    times = daily.get("time") or []
+    forecasts = []
 
-    out = []
-    for name in names:
-        out.append({
-            "Name": name,
-            "Value": 0,
-            "Category": "Good" if name != "UVIndex" else "Low",
-            "CategoryValue": 1,
-            "Type": name,
-        })
+    for i, d in enumerate(times[:days]):
+        date_dt = datetime.fromisoformat(f"{d}T12:00:00+03:00")
+        code = safe_int((daily.get("weather_code") or [3])[i], 3)
+        tmax = safe_float((daily.get("temperature_2m_max") or [0])[i])
+        tmin = safe_float((daily.get("temperature_2m_min") or [0])[i])
+        rfmax = safe_float((daily.get("apparent_temperature_max") or [tmax])[i], tmax)
+        rfmin = safe_float((daily.get("apparent_temperature_min") or [tmin])[i], tmin)
+        precip = safe_float((daily.get("precipitation_sum") or [0])[i])
+        rain = safe_float((daily.get("rain_sum") or [0])[i])
+        showers = safe_float((daily.get("showers_sum") or [0])[i])
+        snow_cm = safe_float((daily.get("snowfall_sum") or [0])[i])
+        precip_prob = safe_int((daily.get("precipitation_probability_max") or [0])[i])
+        wind_kmh = safe_float((daily.get("wind_speed_10m_max") or [0])[i])
+        gust_kmh = safe_float((daily.get("wind_gusts_10m_max") or [wind_kmh])[i], wind_kmh)
+        wind_deg = safe_float((daily.get("wind_direction_10m_dominant") or [90])[i], 90)
+        rain_total = rain + showers
 
-    return out
+        sunrise_raw = (daily.get("sunrise") or [f"{d}T05:00"])[i]
+        sunset_raw = (daily.get("sunset") or [f"{d}T20:45"])[i]
+        try:
+            sunrise_dt = datetime.fromisoformat(sunrise_raw).replace(tzinfo=KYIV_TZ)
+        except Exception:
+            sunrise_dt = datetime.fromisoformat(f"{d}T05:00:00+03:00")
+        try:
+            sunset_dt = datetime.fromisoformat(sunset_raw).replace(tzinfo=KYIV_TZ)
+        except Exception:
+            sunset_dt = datetime.fromisoformat(f"{d}T20:45:00+03:00")
 
+        day_block = make_day_night_block(code, False, precip_prob, precip, rain_total, snow_cm, wind_kmh, wind_deg, gust_kmh)
+        night_block = make_day_night_block(code, True, precip_prob, precip, rain_total, snow_cm, wind_kmh, wind_deg, gust_kmh)
 
-def make_headline() -> Dict[str, Any]:
-    dt = now_kyiv()
-
-    return {
-        "EffectiveDate": local_iso(dt),
-        "EffectiveEpochDate": epoch(dt),
-        "Severity": 7,
-        "Text": "Прогноз обновлён через HTC Weather Proxy",
-        "Category": "general",
-        "EndDate": None,
-        "EndEpochDate": None,
-        "MobileLink": "",
-        "Link": "",
-    }
-
-
-def normalize_daily_forecasts_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    forecasts = payload.get("DailyForecasts", [])
-
-    for f in forecasts:
-        day = f.get("Day")
-        night = f.get("Night")
-
-        if not isinstance(day, dict):
-            day = {}
-
-        if not isinstance(night, dict):
-            night = {}
-
-        if not day.get("IconPhrase") and night.get("IconPhrase"):
-            day["IconPhrase"] = night.get("IconPhrase")
-
-        if not day.get("ShortPhrase"):
-            day["ShortPhrase"] = day.get("IconPhrase", "Переменная облачность")
-
-        if not day.get("LongPhrase"):
-            day["LongPhrase"] = day.get("IconPhrase", "Переменная облачность")
-
-        if "Icon" not in day or not day.get("Icon") or int(day.get("Icon", 3)) >= 33:
-            day["Icon"] = 3
-
-        if "HasPrecipitation" not in day:
-            day["HasPrecipitation"] = False
-
-        if "PrecipitationType" not in day or day["PrecipitationType"] is None:
-            day["PrecipitationType"] = ""
-
-        if "PrecipitationIntensity" not in day or day["PrecipitationIntensity"] is None:
-            day["PrecipitationIntensity"] = ""
-
-        if not night.get("IconPhrase"):
-            night["IconPhrase"] = day.get("IconPhrase", "Переменная облачность")
-
-        if not night.get("ShortPhrase"):
-            night["ShortPhrase"] = night.get("IconPhrase", day.get("IconPhrase", ""))
-
-        if not night.get("LongPhrase"):
-            night["LongPhrase"] = night.get("IconPhrase", day.get("IconPhrase", ""))
-
-        if "Icon" not in night or not night.get("Icon"):
-            night["Icon"] = day.get("Icon", 3)
-
-        if "HasPrecipitation" not in night:
-            night["HasPrecipitation"] = False
-
-        if "PrecipitationType" not in night or night["PrecipitationType"] is None:
-            night["PrecipitationType"] = ""
-
-        if "PrecipitationIntensity" not in night or night["PrecipitationIntensity"] is None:
-            night["PrecipitationIntensity"] = ""
-
-        if "AirAndPollen" not in f or not isinstance(f.get("AirAndPollen"), list) or len(f["AirAndPollen"]) < 6:
-            f["AirAndPollen"] = air_and_pollen()
-
-        f["Day"] = day
-        f["Night"] = night
-
-    payload["DailyForecasts"] = forecasts
-    return payload
-
-
-def force_day_forecast_into_night(payload: Dict[str, Any]) -> Dict[str, Any]:
-    forecasts = payload.get("DailyForecasts", [])
-
-    for f in forecasts:
-        day = f.get("Day")
-        night = f.get("Night")
-
-        if not isinstance(day, dict):
-            continue
-
-        if not isinstance(night, dict):
-            night = {}
-
-        night["Icon"] = day.get("Icon", night.get("Icon", 3))
-        night["IconPhrase"] = day.get("IconPhrase", night.get("IconPhrase", ""))
-        night["ShortPhrase"] = day.get("ShortPhrase", day.get("IconPhrase", night.get("ShortPhrase", "")))
-        night["LongPhrase"] = day.get("LongPhrase", day.get("IconPhrase", night.get("LongPhrase", "")))
-        night["HasPrecipitation"] = day.get("HasPrecipitation", False)
-        night["PrecipitationType"] = day.get("PrecipitationType", "")
-        night["PrecipitationIntensity"] = day.get("PrecipitationIntensity", "")
-
-        for key in [
-            "PrecipitationProbability",
-            "ThunderstormProbability",
-            "RainProbability",
-            "SnowProbability",
-            "IceProbability",
-            "Wind",
-            "WindGust",
-            "Rain",
-            "Snow",
-            "Ice",
-            "HoursOfPrecipitation",
-            "HoursOfRain",
-            "HoursOfSnow",
-            "HoursOfIce",
-            "CloudCover",
-        ]:
-            if key in day:
-                night[key] = day[key]
-
-        f["Night"] = night
-
-    payload["DailyForecasts"] = forecasts
-    return payload
-
-
-def build_daily_forecast_payload(location_key: str, lang: str) -> Dict[str, Any]:
-    lat, lon, key, name, admin, country = parse_location_key(location_key)
-
-    data = owm_get(
-        "/data/2.5/forecast",
-        {
-            "lat": lat,
-            "lon": lon,
-            "units": "metric",
-            "lang": lang,
-        },
-        f"forecast5:{lang}:{lat:.5f},{lon:.5f}",
-    )
-
-    items = data.get("list") or []
-    by_day: Dict[str, List[Dict[str, Any]]] = {}
-
-    for item in items:
-        dt = datetime.fromtimestamp(int(item.get("dt")), tz=timezone.utc).astimezone(KYIV_TZ)
-        by_day.setdefault(dt.strftime("%Y-%m-%d"), []).append(item)
-
-    today = now_kyiv().date()
-    forecasts: List[Dict[str, Any]] = []
-
-    for offset in range(1, 11):
-        d = today + timedelta(days=offset)
-        day_key = d.strftime("%Y-%m-%d")
-        day_items = by_day.get(day_key, [])
-
-        if not day_items:
-            last_temp = 22.0
-            if forecasts:
-                last_temp = forecasts[-1]["Temperature"]["Maximum"]["Value"]
-
-            fake_dt = datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=KYIV_TZ)
-            day_items = [default_forecast_item(fake_dt, last_temp)]
-
-        def item_dt(it: Dict[str, Any]) -> datetime:
-            return datetime.fromtimestamp(int(it.get("dt", epoch(now_kyiv()))), tz=timezone.utc).astimezone(KYIV_TZ)
-
-        day_item = min(day_items, key=lambda it: abs(item_dt(it).hour - 12))
-        night_item = min(day_items, key=lambda it: min(abs(item_dt(it).hour - 21), abs(item_dt(it).hour - 0)))
-
-        temps = []
-        for it in day_items:
-            main = it.get("main") or {}
-            temps.append(round1(main.get("temp_min", main.get("temp", 0))))
-            temps.append(round1(main.get("temp_max", main.get("temp", 0))))
-
-        min_c = min(temps) if temps else round1((day_item.get("main") or {}).get("temp_min", 0))
-        max_c = max(temps) if temps else round1((day_item.get("main") or {}).get("temp_max", 0))
-
-        noon = datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=KYIV_TZ)
-
-        day_block = make_daynight_block(day_item, lang, True)
-        night_block = make_daynight_block(night_item, lang, False)
-
-        forecast = {
-            "Date": local_iso(noon),
-            "EpochDate": epoch(noon),
+        forecasts.append({
+            "Date": iso_kyiv(date_dt),
+            "EpochDate": epoch(date_dt),
             "Sun": {
-                "Rise": local_iso(datetime(d.year, d.month, d.day, 5, 0, 0, tzinfo=KYIV_TZ)),
-                "EpochRise": epoch(datetime(d.year, d.month, d.day, 5, 0, 0, tzinfo=KYIV_TZ)),
-                "Set": local_iso(datetime(d.year, d.month, d.day, 20, 45, 0, tzinfo=KYIV_TZ)),
-                "EpochSet": epoch(datetime(d.year, d.month, d.day, 20, 45, 0, tzinfo=KYIV_TZ)),
+                "Rise": iso_kyiv(sunrise_dt),
+                "EpochRise": epoch(sunrise_dt),
+                "Set": iso_kyiv(sunset_dt),
+                "EpochSet": epoch(sunset_dt),
             },
             "Moon": {
-                "Rise": local_iso(datetime(d.year, d.month, d.day, 22, 0, 0, tzinfo=KYIV_TZ)),
-                "EpochRise": epoch(datetime(d.year, d.month, d.day, 22, 0, 0, tzinfo=KYIV_TZ)),
-                "Set": local_iso(datetime(d.year, d.month, d.day, 7, 0, 0, tzinfo=KYIV_TZ)),
-                "EpochSet": epoch(datetime(d.year, d.month, d.day, 7, 0, 0, tzinfo=KYIV_TZ)),
+                "Rise": iso_kyiv(date_dt.replace(hour=22, minute=0, second=0)),
+                "EpochRise": epoch(date_dt.replace(hour=22, minute=0, second=0)),
+                "Set": iso_kyiv(date_dt.replace(hour=7, minute=0, second=0)),
+                "EpochSet": epoch(date_dt.replace(hour=7, minute=0, second=0)),
                 "Phase": "WaxingCrescent",
-                "Age": offset,
+                "Age": i + 1,
             },
-            "Temperature": {
-                "Minimum": metric_value(round1(min_c), "C", 17),
-                "Maximum": metric_value(round1(max_c), "C", 17),
-            },
-            "RealFeelTemperature": {
-                "Minimum": metric_value(round1(min_c), "C", 17),
-                "Maximum": metric_value(round1(max_c), "C", 17),
-            },
-            "RealFeelTemperatureShade": {
-                "Minimum": metric_value(round1(min_c), "C", 17),
-                "Maximum": metric_value(round1(max_c), "C", 17),
-            },
+            "Temperature": {"Minimum": daily_temp(tmin), "Maximum": daily_temp(tmax)},
+            "RealFeelTemperature": {"Minimum": daily_temp(rfmin), "Maximum": daily_temp(rfmax)},
+            "RealFeelTemperatureShade": {"Minimum": daily_temp(rfmin), "Maximum": daily_temp(rfmax)},
             "HoursOfSun": 8.0,
             "DegreeDaySummary": {
-                "Heating": metric_value(0, "C", 17),
-                "Cooling": metric_value(0, "C", 17),
+                "Heating": {"Value": 0, "Unit": "C", "UnitType": 17},
+                "Cooling": {"Value": 0, "Unit": "C", "UnitType": 17},
             },
-            "AirAndPollen": air_and_pollen(),
+            "AirAndPollen": [
+                {"Name": "AirQuality", "Value": 0, "Category": "Good", "CategoryValue": 1, "Type": "AirQuality"},
+                {"Name": "Grass", "Value": 0, "Category": "Good", "CategoryValue": 1, "Type": "Grass"},
+                {"Name": "Mold", "Value": 0, "Category": "Good", "CategoryValue": 1, "Type": "Mold"},
+                {"Name": "Ragweed", "Value": 0, "Category": "Good", "CategoryValue": 1, "Type": "Ragweed"},
+                {"Name": "Tree", "Value": 0, "Category": "Good", "CategoryValue": 1, "Type": "Tree"},
+                {"Name": "UVIndex", "Value": 0, "Category": "Low", "CategoryValue": 1, "Type": "UVIndex"},
+            ],
             "Day": day_block,
             "Night": night_block,
-            "Sources": ["OpenWeatherMap"],
+            "Sources": ["Open-Meteo"],
             "MobileLink": "",
             "Link": "",
-        }
+        })
 
-        forecasts.append(forecast)
-
-    payload = {
-        "Headline": make_headline(),
+    return {
+        "Headline": {
+            "EffectiveDate": iso_kyiv(kyiv_now()),
+            "EffectiveEpochDate": epoch(kyiv_now()),
+            "Severity": 7,
+            "Text": "Прогноз обновлён через HTC Weather Proxy / Open-Meteo",
+            "Category": "general",
+            "EndDate": None,
+            "EndEpochDate": None,
+            "MobileLink": "",
+            "Link": "",
+        },
         "DailyForecasts": forecasts,
     }
 
-    payload = normalize_daily_forecasts_payload(payload)
-    payload = force_day_forecast_into_night(payload)
 
-    return payload
-
-
-def build_current_conditions(location_key: str, lang: str) -> List[Dict[str, Any]]:
-    lat, lon, key, name, admin, country = parse_location_key(location_key)
-
-    data = owm_get(
-        "/data/2.5/weather",
-        {
-            "lat": lat,
-            "lon": lon,
-            "units": "metric",
-            "lang": lang,
-        },
-        f"current:{lang}:{lat:.5f},{lon:.5f}",
-    )
-
-    dt = datetime.fromtimestamp(int(data.get("dt", time.time())), tz=timezone.utc).astimezone(KYIV_TZ)
-    weather = (data.get("weather") or [{}])[0]
-    weather_id = int(weather.get("id", 800))
-    clouds = int((data.get("clouds") or {}).get("all", 0))
-    phrase = owm_phrase(weather, lang)
-
-    # v13 fix: force current conditions to daytime mode.
-    day = True
-    icon = accu_icon_from_owm(weather_id, clouds, True)
-
-    has_precip, precip_type, precip_intensity = precipitation_from_owm(weather_id)
-
-    main = data.get("main") or {}
-    wind = data.get("wind") or {}
-
-    temp_c = round1(main.get("temp", 0))
-    feels_c = round1(main.get("feels_like", temp_c))
-    humidity = round0(main.get("humidity", 0))
-    pressure = round1(main.get("pressure", 0))
-    wind_speed = ms_to_kmh(wind.get("speed", 0))
-    wind_deg = round0(wind.get("deg", 0))
-
-    return [{
-        "LocalObservationDateTime": local_iso(dt),
-        "EpochTime": epoch(dt),
-        "WeatherText": phrase,
-        "WeatherIcon": icon,
-        "HasPrecipitation": has_precip,
-        "PrecipitationType": precip_type,
-        "IsDayTime": day,
-        "Temperature": temp_block_c(temp_c),
-        "RealFeelTemperature": temp_block_c(feels_c),
-        "RealFeelTemperatureShade": temp_block_c(feels_c),
-        "RelativeHumidity": humidity,
-        "IndoorRelativeHumidity": humidity,
-        "DewPoint": temp_block_c(round1(temp_c - ((100 - humidity) / 5))),
-        "Wind": {
-            "Direction": {
-                "Degrees": wind_deg,
-                "Localized": deg_to_dir(wind_deg),
-                "English": deg_to_dir(wind_deg),
-            },
-            "Speed": {
-                "Metric": metric_value(wind_speed, "km/h", 7),
-                "Imperial": metric_value(round1(wind_speed / 1.60934), "mi/h", 9),
-            },
-        },
-        "WindGust": {
-            "Speed": {
-                "Metric": metric_value(ms_to_kmh(wind.get("gust", wind.get("speed", 0))), "km/h", 7),
-                "Imperial": metric_value(round1(ms_to_kmh(wind.get("gust", wind.get("speed", 0))) / 1.60934), "mi/h", 9),
-            },
-        },
-        "UVIndex": 0,
-        "UVIndexText": "Low",
-        "Visibility": {
-            "Metric": metric_value(round1(float(data.get("visibility", 10000)) / 1000), "km", 6),
-            "Imperial": metric_value(round1((float(data.get("visibility", 10000)) / 1000) / 1.60934), "mi", 2),
-        },
-        "ObstructionsToVisibility": "",
-        "CloudCover": clouds,
-        "Ceiling": {
-            "Metric": metric_value(0, "m", 5),
-            "Imperial": metric_value(0, "ft", 0),
-        },
-        "Pressure": {
-            "Metric": metric_value(pressure, "mb", 14),
-            "Imperial": metric_value(round1(pressure * 0.02953), "inHg", 12),
-        },
-        "PressureTendency": {
-            "LocalizedText": "Steady",
-            "Code": "S",
-        },
-        "ApparentTemperature": temp_block_c(feels_c),
-        "WindChillTemperature": temp_block_c(feels_c),
-        "WetBulbTemperature": temp_block_c(temp_c),
-        "Precip1hr": {
-            "Metric": metric_value(0.0, "mm", 3),
-            "Imperial": metric_value(0.0, "in", 1),
-        },
-        "PrecipitationSummary": {
-            "Precipitation": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "PastHour": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past3Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past6Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past9Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past12Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past18Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-            "Past24Hours": {
-                "Metric": metric_value(0.0, "mm", 3),
-                "Imperial": metric_value(0.0, "in", 1),
-            },
-        },
-        "TemperatureSummary": {
-            "Past6HourRange": {
-                "Minimum": temp_block_c(temp_c),
-                "Maximum": temp_block_c(temp_c),
-            },
-            "Past12HourRange": {
-                "Minimum": temp_block_c(temp_c),
-                "Maximum": temp_block_c(temp_c),
-            },
-            "Past24HourRange": {
-                "Minimum": temp_block_c(temp_c),
-                "Maximum": temp_block_c(temp_c),
-            },
-        },
-        "MobileLink": "",
-        "Link": "",
-    }]
+def fetch_openmeteo_hourly(lat: float, lon: float) -> dict:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": KYIV_TZ_NAME,
+        "forecast_days": 2,
+        "hourly": ",".join([
+            "temperature_2m",
+            "apparent_temperature",
+            "weather_code",
+            "precipitation_probability",
+            "precipitation",
+            "rain",
+            "showers",
+            "snowfall",
+            "wind_speed_10m",
+            "wind_direction_10m",
+        ]),
+    }
+    return http_get_json(OPEN_METEO_BASE, params=params)
 
 
-def build_hourly_forecast(location_key: str, lang: str) -> List[Dict[str, Any]]:
-    lat, lon, key, name, admin, country = parse_location_key(location_key)
+def build_hourly_forecast(key: str, hours: int = 12):
+    loc = resolve_location_key(key)
+    data = fetch_openmeteo_hourly(loc["lat"], loc["lon"])
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    now = kyiv_now().replace(minute=0, second=0, microsecond=0)
+    result = []
 
-    data = owm_get(
-        "/data/2.5/forecast",
-        {
-            "lat": lat,
-            "lon": lon,
-            "units": "metric",
-            "lang": lang,
-        },
-        f"hourly:{lang}:{lat:.5f},{lon:.5f}",
-    )
+    for i, t in enumerate(times):
+        try:
+            dt = datetime.fromisoformat(t).replace(tzinfo=KYIV_TZ)
+        except Exception:
+            continue
+        if dt < now:
+            continue
 
-    items = data.get("list") or []
-    if not items:
-        items = [default_forecast_item(now_kyiv() + timedelta(hours=3), 22.0)]
+        code = safe_int((hourly.get("weather_code") or [3])[i], 3)
+        icon, phrase = openmeteo_icon_phrase(code, night=False)
+        temp = safe_float((hourly.get("temperature_2m") or [0])[i])
+        feel = safe_float((hourly.get("apparent_temperature") or [temp])[i], temp)
+        prob = safe_int((hourly.get("precipitation_probability") or [0])[i])
+        precip = safe_float((hourly.get("precipitation") or [0])[i])
+        rain = safe_float((hourly.get("rain") or [0])[i]) + safe_float((hourly.get("showers") or [0])[i])
+        snow = safe_float((hourly.get("snowfall") or [0])[i])
+        wind_kmh = safe_float((hourly.get("wind_speed_10m") or [0])[i])
+        wind_deg = safe_float((hourly.get("wind_direction_10m") or [90])[i], 90)
+        has_precip = has_precip_from_code(code, precip)
+        ptype = precip_type_from_code(code)
 
-    normalized = []
-    for item in items:
-        dt = datetime.fromtimestamp(int(item.get("dt")), tz=timezone.utc).astimezone(KYIV_TZ)
-        normalized.append((dt, item))
-
-    out: List[Dict[str, Any]] = []
-    start = now_kyiv().replace(minute=0, second=0, microsecond=0)
-
-    for h in range(1, 13):
-        target = start + timedelta(hours=h)
-        nearest_dt, nearest = min(normalized, key=lambda pair: abs((pair[0] - target).total_seconds()))
-
-        weather = (nearest.get("weather") or [{}])[0]
-        weather_id = int(weather.get("id", 800))
-        clouds = int((nearest.get("clouds") or {}).get("all", 0))
-        phrase = owm_phrase(weather, lang)
-
-        # v13 fix: force hourly forecast to daytime too.
-        day = True
-        icon = accu_icon_from_owm(weather_id, clouds, True)
-
-        has_precip, precip_type, precip_intensity = precipitation_from_owm(weather_id)
-
-        main = nearest.get("main") or {}
-        wind = nearest.get("wind") or {}
-
-        temp_c = round1(main.get("temp", 0))
-        feels_c = round1(main.get("feels_like", temp_c))
-        humidity = round0(main.get("humidity", 60))
-        pop = round0(float(nearest.get("pop", 0)) * 100, 0)
-
-        out.append({
-            "DateTime": local_iso(target),
-            "EpochDateTime": epoch(target),
+        result.append({
+            "DateTime": iso_kyiv(dt),
+            "EpochDateTime": epoch(dt),
             "WeatherIcon": icon,
             "IconPhrase": phrase,
             "HasPrecipitation": has_precip,
-            "PrecipitationType": precip_type,
-            "PrecipitationIntensity": precip_intensity,
-            "IsDaylight": day,
-            "Temperature": metric_value(temp_c, "C", 17),
-            "RealFeelTemperature": metric_value(feels_c, "C", 17),
-            "WetBulbTemperature": metric_value(temp_c, "C", 17),
-            "DewPoint": metric_value(round1(temp_c - ((100 - humidity) / 5)), "C", 17),
-            "Wind": {
-                "Speed": metric_value(ms_to_kmh(wind.get("speed", 0)), "km/h", 7),
-                "Direction": {
-                    "Degrees": round0(wind.get("deg", 0)),
-                    "Localized": deg_to_dir(wind.get("deg", 0)),
-                    "English": deg_to_dir(wind.get("deg", 0)),
-                },
+            "PrecipitationType": ptype if has_precip else "",
+            "PrecipitationIntensity": "Light" if has_precip else "",
+            "IsDaylight": True,
+            "Temperature": daily_temp(temp),
+            "RealFeelTemperature": daily_temp(feel),
+            "WetBulbTemperature": daily_temp(temp),
+            "DewPoint": daily_temp(temp - 8),
+            "Wind": {"Speed": metric_speed_kmh(wind_kmh), "Direction": direction_from_degrees(wind_deg)},
+            "WindGust": {"Speed": metric_speed_kmh(wind_kmh)},
+            "RelativeHumidity": 50,
+            "IndoorRelativeHumidity": 50,
+            "Visibility": {
+                "Metric": {"Value": 10.0, "Unit": "km", "UnitType": 6},
+                "Imperial": {"Value": 6.2, "Unit": "mi", "UnitType": 2},
             },
-            "WindGust": {
-                "Speed": metric_value(ms_to_kmh(wind.get("gust", wind.get("speed", 0))), "km/h", 7),
+            "Ceiling": {
+                "Metric": {"Value": 0, "Unit": "m", "UnitType": 5},
+                "Imperial": {"Value": 0, "Unit": "ft", "UnitType": 0},
             },
-            "RelativeHumidity": humidity,
-            "Visibility": metric_value(10.0, "km", 6),
-            "CloudCover": clouds,
             "UVIndex": 0,
             "UVIndexText": "Low",
-            "PrecipitationProbability": pop,
-            "ThunderstormProbability": pop if 200 <= weather_id <= 232 else 0,
-            "RainProbability": pop if precip_type == "Rain" else 0,
-            "SnowProbability": pop if precip_type == "Snow" else 0,
-            "IceProbability": pop if precip_type == "Ice" else 0,
-            "TotalLiquid": metric_value(0.0, "mm", 3),
-            "Rain": metric_value(0.0, "mm", 3),
-            "Snow": metric_value(0.0, "cm", 4),
-            "Ice": metric_value(0.0, "mm", 3),
+            "PrecipitationProbability": prob,
+            "RainProbability": prob if ptype == "Rain" else 0,
+            "SnowProbability": prob if ptype == "Snow" else 0,
+            "IceProbability": 0,
+            "TotalLiquid": daily_rain_mm(precip),
+            "Rain": daily_rain_mm(rain),
+            "Snow": daily_snow_cm(snow),
+            "Ice": daily_rain_mm(0),
+            "CloudCover": cloud_cover_from_code(code),
             "MobileLink": "",
             "Link": "",
         })
 
-    return out
+        if len(result) >= hours:
+            break
+
+    return result
 
 
-@app.route("/", methods=["GET"], strict_slashes=False)
-def root() -> Response:
-    return jsonify({
-        "ok": True,
-        "version": VERSION,
-        "status": "/status",
-    })
+@app.after_request
+def add_headers(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
-@app.route("/status", methods=["GET"], strict_slashes=False)
-def status() -> Response:
+@app.route("/")
+def index():
+    return jsonify({"ok": True, "version": VERSION, "message": "HTC Weather Proxy is running"})
+
+
+@app.route("/status")
+def status():
     return jsonify({
         "ok": True,
         "version": VERSION,
         "openweather_key_present": bool(OPENWEATHER_API_KEY),
-        "shyroke_key": SHYROKE_KEY,
-        "old_shyroke_key": OLD_SHYROKE_KEY,
-        "timezone": timezone_block(),
+        "shyroke_key": SHYROKE["key"],
+        "old_shyroke_key": SHYROKE["old_key"],
+        "timezone": timezone_payload(),
         "fixes": {
             "numeric_city_key": True,
             "geoposition_search": True,
-            "daily_10day": True,
-            "day_forecast_copied_into_night": True,
             "current_conditions_forced_daytime": True,
             "hourly_forecast_forced_daytime": True,
+            "daily_openmeteo": True,
+            "daily_5day": True,
+            "daily_10day": True,
+            "separate_day_night": True,
+            "night_icons": True,
+            "day_forecast_copied_into_night": False,
         },
     })
 
 
-@app.route("/locations/v1/search", methods=["GET"], strict_slashes=False)
-def locations_search() -> Response:
-    err = require_api_key()
-    if err:
-        return err
+@app.route("/locations/v1/search")
+def locations_search():
+    q = request.args.get("q", "")
+    if is_shyroke_query(q):
+        return jsonify([location_payload()])
 
-    lang = get_language()
-    q = request.args.get("q") or request.args.get("query") or ""
-    return jsonify(search_locations(q, lang))
+    try:
+        require_openweather_key()
+        data = http_get_json(f"{OWM_BASE}/geo/1.0/direct", {"q": q, "limit": 10, "appid": OPENWEATHER_API_KEY})
+        results = []
+        for item in data:
+            lat = safe_float(item.get("lat"), SHYROKE["lat"])
+            lon = safe_float(item.get("lon"), SHYROKE["lon"])
+            name = item.get("local_names", {}).get("ru") or item.get("name") or q or "City"
+            name_en = item.get("name") or name
+            country = item.get("country") or "UA"
+            state = item.get("state") or ""
+            gen_key = str(abs(int(lat * 10000)) + abs(int(lon * 10000)))
+            results.append(location_payload(
+                key=gen_key,
+                name_ru=name,
+                name_en=name_en,
+                lat=lat,
+                lon=lon,
+                country_id=country,
+                country_ru=country,
+                country_en=country,
+                admin_ru=state,
+                admin_en=state,
+            ))
+        if results:
+            return jsonify(results)
+    except Exception:
+        pass
 
-
-@app.route("/locations/v1/cities/geoposition/search", methods=["GET"], strict_slashes=False)
-@app.route("/locations/v1/cities/geoposition/search.json", methods=["GET"], strict_slashes=False)
-def locations_geoposition_search() -> Response:
-    err = require_api_key()
-    if err:
-        return err
-
-    lang = get_language()
-    q = request.args.get("q") or f"{SHYROKE_LAT},{SHYROKE_LON}"
-    return jsonify(reverse_geoposition(q, lang))
-
-
-@app.route("/locations/v1/<path:location_key>", methods=["GET"], strict_slashes=False)
-def location_by_key(location_key: str) -> Response:
-    lat, lon, key, name, admin, country = parse_location_key(location_key)
-    return jsonify(location_object(key, name, lat, lon, admin, country))
-
-
-@app.route("/currentconditions/v1/<path:location_key>", methods=["GET"], strict_slashes=False)
-def current_conditions(location_key: str) -> Response:
-    err = require_api_key()
-    if err:
-        return err
-
-    lang = get_language()
-    return jsonify(build_current_conditions(location_key, lang))
-
-
-@app.route("/forecasts/v1/daily/10day/<path:location_key>", methods=["GET"], strict_slashes=False)
-def daily_10day(location_key: str) -> Response:
-    err = require_api_key()
-    if err:
-        return err
-
-    lang = get_language()
-    return jsonify(build_daily_forecast_payload(location_key, lang))
+    return jsonify([location_payload()])
 
 
-@app.route("/forecasts/v1/hourly/12hour/<path:location_key>", methods=["GET"], strict_slashes=False)
-def hourly_12hour(location_key: str) -> Response:
-    err = require_api_key()
-    if err:
-        return err
+@app.route("/locations/v1/cities/geoposition/search")
+@app.route("/locations/v1/cities/geoposition/search.json")
+def geoposition_search():
+    lat, lon = parse_geoposition()
+    if distance_km(lat, lon, SHYROKE["lat"], SHYROKE["lon"]) < 50:
+        return jsonify(location_payload())
 
-    lang = get_language()
-    return jsonify(build_hourly_forecast(location_key, lang))
+    try:
+        require_openweather_key()
+        data = http_get_json(f"{OWM_BASE}/geo/1.0/reverse", {
+            "lat": lat,
+            "lon": lon,
+            "limit": 1,
+            "appid": OPENWEATHER_API_KEY,
+        })
+        if data:
+            item = data[0]
+            name = item.get("local_names", {}).get("ru") or item.get("name") or "City"
+            name_en = item.get("name") or name
+            country = item.get("country") or "UA"
+            state = item.get("state") or ""
+            gen_key = str(abs(int(lat * 10000)) + abs(int(lon * 10000)))
+            return jsonify(location_payload(
+                key=gen_key,
+                name_ru=name,
+                name_en=name_en,
+                lat=lat,
+                lon=lon,
+                country_id=country,
+                country_ru=country,
+                country_en=country,
+                admin_ru=state,
+                admin_en=state,
+            ))
+    except Exception:
+        pass
+
+    return jsonify(location_payload())
 
 
-@app.route("/widget/htc2/city-find.asp", methods=["GET"], strict_slashes=False)
-def widget_city_find() -> Response:
-    q = request.args.get("q") or request.args.get("city") or request.args.get("name") or "shyroke"
-    lang = get_language()
-    locs = search_locations(q, lang)
-    loc = locs[0] if locs else location_object()
+@app.route("/locations/v1/timezones")
+@app.route("/locations/v1/timezones/<path:key>")
+def timezones(key=None):
+    return jsonify(timezone_payload())
 
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<citylist>
-  <city
-    name="{loc.get("LocalizedName", SHYROKE_NAME_RU)}"
-    country="{loc.get("Country", {}).get("ID", "UA")}"
-    state="{loc.get("AdministrativeArea", {}).get("LocalizedName", "")}"
-    code="{loc.get("Key", SHYROKE_KEY)}"
-    latitude="{loc.get("GeoPosition", {}).get("Latitude", SHYROKE_LAT)}"
-    longitude="{loc.get("GeoPosition", {}).get("Longitude", SHYROKE_LON)}" />
-</citylist>
-"""
+
+@app.route("/locations/v1/<path:key>")
+def location_by_key(key):
+    loc = resolve_location_key(key)
+    return jsonify(location_payload(
+        key=loc["key"],
+        name_ru=loc["name_ru"],
+        name_en=loc["name_en"],
+        lat=loc["lat"],
+        lon=loc["lon"],
+    ))
+
+
+@app.route("/currentconditions/v1/<path:key>")
+def current_conditions(key):
+    try:
+        require_openweather_key()
+        loc = resolve_location_key(key)
+        data = http_get_json(f"{OWM_BASE}/data/2.5/weather", {
+            "lat": loc["lat"],
+            "lon": loc["lon"],
+            "appid": OPENWEATHER_API_KEY,
+            "units": "metric",
+            "lang": request.args.get("language", "ru"),
+        })
+
+        weather = (data.get("weather") or [{}])[0]
+        main = data.get("main") or {}
+        wind = data.get("wind") or {}
+        clouds = data.get("clouds") or {}
+        rain = data.get("rain") or {}
+        snow = data.get("snow") or {}
+
+        weather_id = safe_int(weather.get("id"), 800)
+        icon_code = weather.get("icon", "01d")
+        icon, phrase = owm_icon_phrase(weather_id, icon_code, force_daytime=True)
+
+        dt = datetime.fromtimestamp(safe_int(data.get("dt"), int(time.time())), KYIV_TZ)
+        temp = safe_float(main.get("temp"))
+        feels = safe_float(main.get("feels_like"), temp)
+        pressure = safe_float(main.get("pressure"), 1015)
+        humidity = safe_int(main.get("humidity"), 50)
+        rain_1h = safe_float(rain.get("1h"), 0)
+        snow_1h = safe_float(snow.get("1h"), 0)
+        precip_1h = rain_1h + snow_1h
+        wind_kmh = safe_float(wind.get("speed"), 0) * 3.6
+        gust_kmh = safe_float(wind.get("gust"), wind.get("speed", 0)) * 3.6
+
+        payload = [{
+            "LocalObservationDateTime": iso_kyiv(dt),
+            "EpochTime": epoch(dt),
+            "WeatherText": phrase,
+            "WeatherIcon": icon,
+            "HasPrecipitation": precip_1h > 0.01,
+            "PrecipitationType": "Rain" if rain_1h > 0 else ("Snow" if snow_1h > 0 else ""),
+            "IsDayTime": True,
+            "Temperature": metric_temp(temp),
+            "RealFeelTemperature": metric_temp(feels),
+            "RealFeelTemperatureShade": metric_temp(feels),
+            "ApparentTemperature": metric_temp(feels),
+            "WindChillTemperature": metric_temp(feels),
+            "WetBulbTemperature": metric_temp(temp),
+            "DewPoint": metric_temp(safe_float(main.get("dew_point"), temp - 8)),
+            "RelativeHumidity": humidity,
+            "IndoorRelativeHumidity": humidity,
+            "Wind": {"Direction": direction_from_degrees(safe_float(wind.get("deg"), 0)), "Speed": metric_speed_kmh(wind_kmh)},
+            "WindGust": {"Speed": metric_speed_kmh(gust_kmh)},
+            "UVIndex": 0,
+            "UVIndexText": "Low",
+            "Visibility": {
+                "Metric": {"Value": round(safe_float(data.get("visibility"), 10000) / 1000, 1), "Unit": "km", "UnitType": 6},
+                "Imperial": {"Value": 6.2, "Unit": "mi", "UnitType": 2},
+            },
+            "ObstructionsToVisibility": "",
+            "CloudCover": safe_int(clouds.get("all"), 0),
+            "Ceiling": {
+                "Metric": {"Value": 0, "Unit": "m", "UnitType": 5},
+                "Imperial": {"Value": 0, "Unit": "ft", "UnitType": 0},
+            },
+            "Pressure": {
+                "Metric": {"Value": pressure, "Unit": "mb", "UnitType": 14},
+                "Imperial": {"Value": mb_to_inhg(pressure), "Unit": "inHg", "UnitType": 12},
+            },
+            "PressureTendency": {"LocalizedText": "Steady", "Code": "S"},
+            "Precip1hr": metric_length_mm(precip_1h),
+            "PrecipitationSummary": {
+                "Precipitation": metric_length_mm(precip_1h),
+                "PastHour": metric_length_mm(precip_1h),
+                "Past3Hours": metric_length_mm(precip_1h),
+                "Past6Hours": metric_length_mm(precip_1h),
+                "Past9Hours": metric_length_mm(precip_1h),
+                "Past12Hours": metric_length_mm(precip_1h),
+                "Past18Hours": metric_length_mm(precip_1h),
+                "Past24Hours": metric_length_mm(precip_1h),
+            },
+            "TemperatureSummary": {
+                "Past6HourRange": {"Minimum": metric_temp(temp), "Maximum": metric_temp(temp)},
+                "Past12HourRange": {"Minimum": metric_temp(temp), "Maximum": metric_temp(temp)},
+                "Past24HourRange": {"Minimum": metric_temp(temp), "Maximum": metric_temp(temp)},
+            },
+            "MobileLink": "",
+            "Link": "",
+        }]
+
+        return jsonify(payload)
+    except Exception as e:
+        return proxy_error(e)
+
+
+@app.route("/forecasts/v1/daily/5day/<path:key>")
+def daily_5day(key):
+    try:
+        return jsonify(build_daily_forecast(key, 5))
+    except Exception as e:
+        return proxy_error(e)
+
+
+@app.route("/forecasts/v1/daily/10day/<path:key>")
+def daily_10day(key):
+    try:
+        return jsonify(build_daily_forecast(key, 10))
+    except Exception as e:
+        return proxy_error(e)
+
+
+@app.route("/forecasts/v1/hourly/12hour/<path:key>")
+def hourly_12hour(key):
+    try:
+        return jsonify(build_hourly_forecast(key, 12))
+    except Exception as e:
+        return proxy_error(e)
+
+
+@app.route("/widget/htc2/city-find.asp")
+def htc_city_find():
+    loc = location_payload()
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<adc_database>
+  <city>
+    <location>{loc["LocalizedName"]}</location>
+    <location_key>{loc["Key"]}</location_key>
+    <country>{loc["Country"]["LocalizedName"]}</country>
+    <timezone>{loc["TimeZone"]["Name"]}</timezone>
+    <latitude>{loc["GeoPosition"]["Latitude"]}</latitude>
+    <longitude>{loc["GeoPosition"]["Longitude"]}</longitude>
+  </city>
+</adc_database>'''
     return Response(xml, mimetype="application/xml; charset=utf-8")
 
 
 @app.errorhandler(404)
-def not_found(e: Exception) -> Response:
-    return jsonify({
-        "error": "not_found",
-        "path": request.path,
-        "version": VERSION,
-    }), 404
+def not_found(_):
+    return jsonify({"ok": False, "ProxyError": "Route not found", "path": request.path, "version": VERSION}), 404
 
 
-@app.errorhandler(Exception)
-def handle_exception(e: Exception) -> Response:
-    return jsonify({
-        "error": str(e),
-        "type": e.__class__.__name__,
-        "version": VERSION,
-    }), 500
+@app.errorhandler(500)
+def internal_error(e):
+    return proxy_error(e, 500)
 
 
 if __name__ == "__main__":
