@@ -9,7 +9,7 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-VERSION = "htc-weather-proxy-v16-force-fallback-200"
+VERSION = "htc-weather-proxy-v17-htc-temperature-fields"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 OWM_BASE = "https://api.openweathermap.org"
@@ -117,7 +117,19 @@ def metric_temp(c: float) -> dict:
 
 
 def daily_temp(c: float) -> dict:
-    return {"Value": round(safe_float(c), 1), "Unit": "C", "UnitType": 17}
+    # v17: HTC Weather 9.x parses different endpoints with different schemas.
+    # Some screens expect AccuWeather-style {Value, Unit, UnitType};
+    # other old HTC parsers look for Metric/Imperial sub-objects.
+    # Return both forms in one object; extra JSON keys are ignored by normal clients,
+    # but HTC can now find C/F temperatures in hourly and daily forecast screens.
+    c = round(safe_float(c), 1)
+    return {
+        "Value": c,
+        "Unit": "C",
+        "UnitType": 17,
+        "Metric": {"Value": c, "Unit": "C", "UnitType": 17},
+        "Imperial": {"Value": c_to_f(c), "Unit": "F", "UnitType": 18},
+    }
 
 
 def metric_length_mm(mm: float) -> dict:
@@ -500,6 +512,19 @@ def build_daily_forecast_from_openmeteo(key: str, days: int):
 
 
 def make_daily_item(date_dt, sunrise_dt, sunset_dt, index, tmin, tmax, rfmin, rfmax, day_block, night_block, source):
+    # v17: duplicate day/night temperatures in the places older HTC UI reads from.
+    # Some HTC daily views show only Night temperature if Day.Temperature is absent.
+    day_block = dict(day_block or {})
+    night_block = dict(night_block or {})
+    day_block.setdefault("Temperature", daily_temp(tmax))
+    day_block.setdefault("RealFeelTemperature", daily_temp(rfmax))
+    day_block.setdefault("TemperatureMaximum", daily_temp(tmax))
+    day_block.setdefault("HighTemperature", daily_temp(tmax))
+    night_block.setdefault("Temperature", daily_temp(tmin))
+    night_block.setdefault("RealFeelTemperature", daily_temp(rfmin))
+    night_block.setdefault("TemperatureMinimum", daily_temp(tmin))
+    night_block.setdefault("LowTemperature", daily_temp(tmin))
+
     return {
         "Date": iso_kyiv(date_dt),
         "EpochDate": epoch(date_dt),
@@ -517,7 +542,18 @@ def make_daily_item(date_dt, sunrise_dt, sunset_dt, index, tmin, tmax, rfmin, rf
             "Phase": "WaxingCrescent",
             "Age": index + 1,
         },
-        "Temperature": {"Minimum": daily_temp(tmin), "Maximum": daily_temp(tmax)},
+        "Temperature": {
+            "Minimum": daily_temp(tmin),
+            "Maximum": daily_temp(tmax),
+            "Min": daily_temp(tmin),
+            "Max": daily_temp(tmax),
+            "Low": daily_temp(tmin),
+            "High": daily_temp(tmax),
+        },
+        "HighTemperature": daily_temp(tmax),
+        "LowTemperature": daily_temp(tmin),
+        "DayTemperature": daily_temp(tmax),
+        "NightTemperature": daily_temp(tmin),
         "RealFeelTemperature": {"Minimum": daily_temp(rfmin), "Maximum": daily_temp(rfmax)},
         "RealFeelTemperatureShade": {"Minimum": daily_temp(rfmin), "Maximum": daily_temp(rfmax)},
         "HoursOfSun": 8.0,
@@ -800,6 +836,10 @@ def build_hourly_forecast(key: str, hours: int = 12):
             "PrecipitationIntensity": "Light" if has_precip else "",
             "IsDaylight": True,
             "Temperature": daily_temp(temp),
+            "TemperatureValue": round(safe_float(temp), 1),
+            "Temp": daily_temp(temp),
+            "TemperatureMetric": {"Value": round(safe_float(temp), 1), "Unit": "C", "UnitType": 17},
+            "TemperatureImperial": {"Value": c_to_f(temp), "Unit": "F", "UnitType": 18},
             "RealFeelTemperature": daily_temp(feel),
             "WetBulbTemperature": daily_temp(temp),
             "DewPoint": daily_temp(temp - 8),
@@ -1124,6 +1164,10 @@ def build_hourly_forecast_fallback(key: str, hours: int = 12, reason: str = ""):
             "PrecipitationIntensity": "",
             "IsDaylight": True,
             "Temperature": daily_temp(temp),
+            "TemperatureValue": round(safe_float(temp), 1),
+            "Temp": daily_temp(temp),
+            "TemperatureMetric": {"Value": round(safe_float(temp), 1), "Unit": "C", "UnitType": 17},
+            "TemperatureImperial": {"Value": c_to_f(temp), "Unit": "F", "UnitType": 18},
             "RealFeelTemperature": daily_temp(feel),
             "WetBulbTemperature": daily_temp(temp),
             "DewPoint": daily_temp(temp - 8),
