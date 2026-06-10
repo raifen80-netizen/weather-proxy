@@ -9,7 +9,7 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-VERSION = "htc-weather-proxy-v15-openmeteo-cache-fallback"
+VERSION = "htc-weather-proxy-v16-force-fallback-200"
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 OWM_BASE = "https://api.openweathermap.org"
@@ -667,6 +667,61 @@ def build_daily_forecast_fallback(key: str, days: int, reason: str = ""):
     return daily_payload(forecasts, text)
 
 
+def build_daily_forecast_static_fallback(key: str, days: int, reason: str = ""):
+    # Absolute last-resort daily forecast. It does not call any external API.
+    # This protects old HTC Weather from HTTP 500 when Open-Meteo/OpenWeather are unavailable.
+    try:
+        resolve_location_key(key)
+    except Exception:
+        pass
+
+    today = kyiv_now().date()
+    forecasts = []
+    for i in range(days):
+        d_obj = datetime.fromordinal(today.toordinal() + i + 1).replace(hour=12, minute=0, second=0, tzinfo=KYIV_TZ)
+        tmin = 16.0 + (i % 3)
+        tmax = 24.0 + (i % 4)
+        rfmin = tmin
+        rfmax = tmax
+        day_block = {
+            "Icon": 3,
+            "IconPhrase": "переменная облачность",
+            "ShortPhrase": "переменная облачность",
+            "LongPhrase": "переменная облачность",
+            "HasPrecipitation": False,
+            "PrecipitationType": "",
+            "PrecipitationIntensity": "",
+            "PrecipitationProbability": 0,
+            "ThunderstormProbability": 0,
+            "RainProbability": 0,
+            "SnowProbability": 0,
+            "IceProbability": 0,
+            "CloudCover": 45,
+            "HoursOfPrecipitation": 0,
+            "HoursOfRain": 0,
+            "HoursOfSnow": 0,
+            "HoursOfIce": 0,
+            "Rain": daily_rain_mm(0),
+            "Snow": daily_snow_cm(0),
+            "Ice": daily_rain_mm(0),
+            "Wind": {"Speed": metric_speed_kmh(10.0), "Direction": direction_from_degrees(90)},
+            "WindGust": {"Speed": metric_speed_kmh(14.0)},
+        }
+        night_block = dict(day_block)
+        night_block["Icon"] = 35
+        night_block["IconPhrase"] = "переменная облачность"
+        night_block["ShortPhrase"] = "переменная облачность"
+        night_block["LongPhrase"] = "переменная облачность"
+        sunrise_dt = d_obj.replace(hour=5, minute=0, second=0)
+        sunset_dt = d_obj.replace(hour=20, minute=45, second=0)
+        forecasts.append(make_daily_item(d_obj, sunrise_dt, sunset_dt, i, tmin, tmax, rfmin, rfmax, day_block, night_block, "StaticFallback"))
+
+    text = "Резервный прогноз: внешний погодный API временно недоступен"
+    if reason:
+        text += " / " + str(reason)[:80]
+    return daily_payload(forecasts, text)
+
+
 def build_daily_forecast(key: str, days: int):
     cache_key = f"daily:{key}:{days}"
     cached = cache_get(cache_key)
@@ -816,6 +871,8 @@ def status():
             "day_forecast_copied_into_night": False,
             "server_side_cache": True,
             "openmeteo_429_fallback": True,
+            "daily_endpoints_force_http_200": True,
+            "hourly_endpoint_force_http_200": True,
         },
     })
 
@@ -1014,35 +1071,105 @@ def current_conditions(key):
 
 @app.route("/forecasts/v1/daily/5day/<path:key>")
 def daily_5day(key):
+    # v16: daily endpoint must never return ProxyError / HTTP 500 to old HTC Weather.
     try:
-        return jsonify(build_daily_forecast(key, 5))
+        payload = build_daily_forecast(key, 5)
+        if isinstance(payload, dict) and payload.get("ProxyError"):
+            payload = build_daily_forecast_fallback(key, 5, reason=payload.get("ProxyError"))
+        return jsonify(payload), 200
     except Exception as e:
-        # В v15 daily не должен падать ProxyError из-за Open-Meteo 429.
-        return jsonify(build_daily_forecast_fallback(key, 5, reason=e))
+        try:
+            return jsonify(build_daily_forecast_fallback(key, 5, reason=e)), 200
+        except Exception as e2:
+            return jsonify(build_daily_forecast_static_fallback(key, 5, reason=e2)), 200
 
 
 @app.route("/forecasts/v1/daily/10day/<path:key>")
 def daily_10day(key):
+    # v16: daily endpoint must never return ProxyError / HTTP 500 to old HTC Weather.
     try:
-        return jsonify(build_daily_forecast(key, 10))
+        payload = build_daily_forecast(key, 10)
+        if isinstance(payload, dict) and payload.get("ProxyError"):
+            payload = build_daily_forecast_fallback(key, 10, reason=payload.get("ProxyError"))
+        return jsonify(payload), 200
     except Exception as e:
-        # В v15 daily не должен падать ProxyError из-за Open-Meteo 429.
-        return jsonify(build_daily_forecast_fallback(key, 10, reason=e))
+        try:
+            return jsonify(build_daily_forecast_fallback(key, 10, reason=e)), 200
+        except Exception as e2:
+            return jsonify(build_daily_forecast_static_fallback(key, 10, reason=e2)), 200
+
+
+def build_hourly_forecast_fallback(key: str, hours: int = 12, reason: str = ""):
+    # Absolute fallback for HTC hourly endpoint. No external API is required.
+    try:
+        resolve_location_key(key)
+    except Exception:
+        pass
+
+    now = kyiv_now().replace(minute=0, second=0, microsecond=0)
+    result = []
+    for i in range(hours):
+        dt = now.replace(hour=now.hour) + __import__("datetime").timedelta(hours=i)
+        temp = 24.0 + math.sin(i / 3.0) * 2.0
+        feel = temp
+        icon = 3 if 6 <= dt.hour <= 20 else 35
+        phrase = "переменная облачность"
+        result.append({
+            "DateTime": iso_kyiv(dt),
+            "EpochDateTime": epoch(dt),
+            "WeatherIcon": icon,
+            "IconPhrase": phrase,
+            "HasPrecipitation": False,
+            "PrecipitationType": "",
+            "PrecipitationIntensity": "",
+            "IsDaylight": True,
+            "Temperature": daily_temp(temp),
+            "RealFeelTemperature": daily_temp(feel),
+            "WetBulbTemperature": daily_temp(temp),
+            "DewPoint": daily_temp(temp - 8),
+            "Wind": {"Speed": metric_speed_kmh(10.0), "Direction": direction_from_degrees(90)},
+            "WindGust": {"Speed": metric_speed_kmh(14.0)},
+            "RelativeHumidity": 50,
+            "IndoorRelativeHumidity": 50,
+            "Visibility": {
+                "Metric": {"Value": 10.0, "Unit": "km", "UnitType": 6},
+                "Imperial": {"Value": 6.2, "Unit": "mi", "UnitType": 2},
+            },
+            "Ceiling": {
+                "Metric": {"Value": 0, "Unit": "m", "UnitType": 5},
+                "Imperial": {"Value": 0, "Unit": "ft", "UnitType": 0},
+            },
+            "UVIndex": 0,
+            "UVIndexText": "Low",
+            "PrecipitationProbability": 0,
+            "RainProbability": 0,
+            "SnowProbability": 0,
+            "IceProbability": 0,
+            "TotalLiquid": daily_rain_mm(0),
+            "Rain": daily_rain_mm(0),
+            "Snow": daily_snow_cm(0),
+            "Ice": daily_rain_mm(0),
+            "CloudCover": 45,
+            "MobileLink": "",
+            "Link": "",
+        })
+    return result
 
 
 @app.route("/forecasts/v1/hourly/12hour/<path:key>")
 def hourly_12hour(key):
+    # v16: hourly endpoint also must never return HTTP 500 to old HTC Weather.
     try:
         cache_key = f"hourly:{key}:12"
         cached = cache_get(cache_key)
         if cached:
-            return jsonify(cached)
-        return jsonify(cache_set(cache_key, build_hourly_forecast(key, 12), HOURLY_CACHE_TTL_SECONDS))
+            return jsonify(cached), 200
+        return jsonify(cache_set(cache_key, build_hourly_forecast(key, 12), HOURLY_CACHE_TTL_SECONDS)), 200
     except Exception as e:
         stale = cache_get_any(f"hourly:{key}:12")
         if stale:
-            return jsonify(stale)
-        return proxy_error(e)
+            return jsonify(stale), 200
+        return jsonify(build_hourly_forecast_fallback(key, 12, reason=e)), 200
 
 
 @app.route("/widget/htc2/city-find.asp")
